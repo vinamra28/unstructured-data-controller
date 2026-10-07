@@ -23,13 +23,18 @@ import (
 	"strconv"
 	"strings"
 
+	"time"
+
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"go.opentelemetry.io/otel/attribute"
+
 	operatorv1alpha1 "github.com/redhat-data-and-ai/unstructured-data-controller/api/v1alpha1"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/auth"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/embedding"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/k8sclient"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/logger"
+	udcmetrics "github.com/redhat-data-and-ai/unstructured-data-controller/pkg/metrics"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/snowflake"
 )
 
@@ -40,7 +45,9 @@ type getChunksArgs struct {
 	Limit          int    `json:"limit,omitempty" jsonschema:"Number of chunks to return. Use a lower value (1-5) for specific factual questions. Use a higher value for broad questions like summaries or 'tell me everything about X'. Defaults to 10 if not specified."`
 }
 
-func RegisterGetChunksForEmbeddings(s *mcp.Server, k8sClient *k8sclient.Client, embeddingClient *embedding.HTTPClient) {
+func RegisterGetChunksForEmbeddings(
+	s *mcp.Server, k8sClient *k8sclient.Client, embeddingClient *embedding.HTTPClient, mp *udcmetrics.Provider,
+) {
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "get_chunks_for_embeddings",
 		Description: `Search for relevant text chunks in a pipeline's data product using vector cosine similarity. Optionally scope the search to specific files using file_path_filter with glob patterns (e.g. "*/README.md", "*/aemv2/*").
@@ -48,13 +55,20 @@ If pipeline_name is not known, call list_unstructured_data_pipelines_for_user fi
 If the returned chunks are not sufficient to answer the user's question, you may call get_processed_document with the same pipeline_name and the file_id from the top matching chunk to retrieve the full processed document for more context.
 On error: report the exact error to the user and STOP. Do NOT retry with other pipelines.
 On follow-up: if the user is not satisfied, ask them which pipeline to search. Do NOT automatically try other pipelines.`,
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, args getChunksArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, args getChunksArgs) (res *mcp.CallToolResult, _ any, _ error) {
 		username := ""
 		if tokenInfo, ok := auth.TokenInfoFromContext(ctx); ok {
 			username = tokenInfo.Username
 		}
 		ctx = logger.NewContext(ctx, uuid.NewString(), "get_chunks_for_embeddings", username)
 		log := logger.FromContext(ctx)
+
+		if mp != nil {
+			var endTool func(bool)
+			ctx, endTool = mp.ToolObserver(ctx, "get_chunks_for_embeddings",
+				attribute.String("mcp.pipeline_name", args.PipelineName))
+			defer func() { endTool(res != nil && res.IsError) }()
+		}
 
 		log.Info("tool invoked", "pipeline_name", args.PipelineName)
 
@@ -91,7 +105,11 @@ On follow-up: if the user is not satisfied, ask them which pipeline to search. D
 			}, nil, nil
 		}
 
+		k8sStart := time.Now()
 		qc, err := k8sClient.GetPipelineQueryConfig(ctx, args.PipelineName, operatorv1alpha1.StageTypeVectorEmbeddingsGenerator)
+		if mp != nil {
+			mp.RecordExternalCall(ctx, "k8s", "get_pipeline_query_config", time.Since(k8sStart), err)
+		}
 		if err != nil {
 			log.Error("failed to get pipeline query config", "error", err)
 			return &mcp.CallToolResult{
@@ -109,7 +127,11 @@ On follow-up: if the user is not satisfied, ask them which pipeline to search. D
 		}
 
 		log.Info("generating embedding for query")
+		embStart := time.Now()
 		result, err := embeddingClient.GenerateEmbeddings(ctx, []string{args.Query}, "float")
+		if mp != nil {
+			mp.RecordExternalCall(ctx, "embedding", "generate", time.Since(embStart), err)
+		}
 		if err != nil {
 			log.Error("failed to generate embedding", "error", err)
 			return &mcp.CallToolResult{
@@ -141,10 +163,18 @@ On follow-up: if the user is not satisfied, ask them which pipeline to search. D
 		if args.FilePathFilter != "" {
 			filePattern := convertFileGlobToSQL(args.FilePathFilter)
 			log.Info("searching snowflake with file filter", "database", databaseName, "schema", schemaName, "table", tableName, "filePattern", filePattern, "limit", limit)
+			sfStart := time.Now()
 			chunks, err = snowflake.SearchChunksWithFileFilter(ctx, oauthToken, databaseName, schemaName, tableName, vectorLiteral, filePattern, limit)
+			if mp != nil {
+				mp.RecordExternalCall(ctx, "snowflake", "search_chunks_with_file_filter", time.Since(sfStart), err)
+			}
 		} else {
 			log.Info("searching snowflake", "database", databaseName, "schema", schemaName, "table", tableName, "limit", limit)
+			sfStart := time.Now()
 			chunks, err = snowflake.SearchChunks(ctx, oauthToken, databaseName, schemaName, tableName, vectorLiteral, limit)
+			if mp != nil {
+				mp.RecordExternalCall(ctx, "snowflake", "search_chunks", time.Since(sfStart), err)
+			}
 		}
 		if err != nil {
 			log.Error("failed to search chunks in snowflake", "error", err, "database", databaseName, "schema", schemaName, "table", tableName)
