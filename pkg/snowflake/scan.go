@@ -62,7 +62,7 @@ func scanRows[T any](rows *sql.Rows) ([]T, error) {
 			if val == nil {
 				continue
 			}
-			rv.Field(idx).SetString(fmt.Sprintf("%s", val))
+			rv.Field(idx).SetString(dbValueString(val))
 		}
 
 		results = append(results, item)
@@ -73,4 +73,11 @@ func scanRows[T any](rows *sql.Rows) ([]T, error) {
 	}
 
 	return results, nil
+}
+
+func dbValueString(value any) string {
+	if bytes, ok := value.([]byte); ok {
+		return string(bytes)
+	}
+	return fmt.Sprint(value)
 }

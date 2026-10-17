@@ -19,7 +19,9 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -30,6 +32,7 @@ import (
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/embedding"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/k8sclient"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/logger"
+	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/reranker"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/snowflake"
 )
 
@@ -40,7 +43,38 @@ type getChunksArgs struct {
 	Limit          int    `json:"limit,omitempty" jsonschema:"Number of chunks to return. Use a lower value (1-5) for specific factual questions. Use a higher value for broad questions like summaries or 'tell me everything about X'. Defaults to 10 if not specified."`
 }
 
-func RegisterGetChunksForEmbeddings(s *mcp.Server, k8sClient *k8sclient.Client, embeddingClient *embedding.HTTPClient) {
+const (
+	// rerankerOverFetchMultiplier controls how many more candidates to retrieve
+	// from Snowflake when reranking is enabled, giving the cross-encoder a
+	// broader set to re-score before truncating to the requested limit.
+	rerankerOverFetchMultiplier = 3
+
+	// minRerankerCandidates floors the candidate pool so that small limits still
+	// get a meaningful pool to re-score. Without it a limit of 1 would rerank
+	// only 3 chunks, which is precisely the case where a wide pool helps most.
+	minRerankerCandidates = 50
+
+	// defaultChunkLimit is used when the caller does not specify a limit.
+	defaultChunkLimit = 10
+
+	// maxChunkLimit caps the user-supplied limit to prevent unbounded Snowflake
+	// queries and oversized reranker payloads (especially after over-fetching).
+	maxChunkLimit = 100
+
+	// maxRerankerCandidates caps the number of documents sent to the reranker.
+	// Most cross-encoder endpoints (vLLM, Cohere, TEI) cap at 100-256 documents.
+	maxRerankerCandidates = 200
+
+	// maxRerankerDocumentRunes caps the text sent per candidate so one oversized
+	// chunk cannot blow the payload or overflow the model's window. Sized against
+	// Qwen3-Reranker-4B's 8,192-token context, which covers query plus document
+	// per pair. The budget is in runes rather than tokens because the ratio is
+	// language-dependent: Latin text runs ~4 runes per token, CJK closer to 1, so
+	// this holds even in the worst case while leaving room for the query.
+	maxRerankerDocumentRunes = 6000
+)
+
+func RegisterGetChunksForEmbeddings(s *mcp.Server, k8sClient *k8sclient.Client, embeddingClient *embedding.HTTPClient, rerankerClient reranker.Reranker) {
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "get_chunks_for_embeddings",
 		Description: `Search for relevant text chunks in a pipeline's data product using vector cosine similarity. Optionally scope the search to specific files using file_path_filter with glob patterns (e.g. "*/README.md", "*/aemv2/*").
@@ -128,26 +162,21 @@ On follow-up: if the user is not satisfied, ask them which pipeline to search. D
 		log.Info("embedding generated", "vector_dimensions", len(result.Embeddings[0]))
 		vectorLiteral := formatVectorLiteral(result.Embeddings[0])
 
-		databaseName := strings.ToUpper(strings.ReplaceAll(qc.Database, "-", "_"))
-		schemaName := strings.ToUpper(qc.Schema)
-		tableName := strings.ToUpper(qc.Table)
-
-		limit := args.Limit
-		if limit <= 0 {
-			limit = 10
+		searchConfig := chunkSearchConfig{
+			oauthToken:    oauthToken,
+			database:      strings.ToUpper(strings.ReplaceAll(qc.Database, "-", "_")),
+			schema:        strings.ToUpper(qc.Schema),
+			table:         strings.ToUpper(qc.Table),
+			vectorLiteral: vectorLiteral,
+			query:         args.Query,
+			filePattern:   convertFileGlobToSQL(args.FilePathFilter),
+			limit:         resolveLimit(args.Limit),
 		}
+		searchConfig.fetchLimit = resolveFetchLimit(searchConfig.limit, rerankerClient != nil)
 
-		var chunks []snowflake.ChunkResult
-		if args.FilePathFilter != "" {
-			filePattern := convertFileGlobToSQL(args.FilePathFilter)
-			log.Info("searching snowflake with file filter", "database", databaseName, "schema", schemaName, "table", tableName, "filePattern", filePattern, "limit", limit)
-			chunks, err = snowflake.SearchChunksWithFileFilter(ctx, oauthToken, databaseName, schemaName, tableName, vectorLiteral, filePattern, limit)
-		} else {
-			log.Info("searching snowflake", "database", databaseName, "schema", schemaName, "table", tableName, "limit", limit)
-			chunks, err = snowflake.SearchChunks(ctx, oauthToken, databaseName, schemaName, tableName, vectorLiteral, limit)
-		}
+		chunks, err := retrieveChunks(ctx, searchConfig, rerankerClient)
 		if err != nil {
-			log.Error("failed to search chunks in snowflake", "error", err, "database", databaseName, "schema", schemaName, "table", tableName)
+			log.Error("failed to search chunks in snowflake", "error", err, "database", searchConfig.database, "schema", searchConfig.schema, "table", searchConfig.table)
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Error searching chunks: %v", err)}},
 				IsError: true,
@@ -181,6 +210,75 @@ On follow-up: if the user is not satisfied, ask them which pipeline to search. D
 	})
 }
 
+// chunkSearchConfig carries the resolved Snowflake coordinates and the tuning
+// knobs for a single chunk retrieval.
+type chunkSearchConfig struct {
+	oauthToken    string
+	database      string
+	schema        string
+	table         string
+	vectorLiteral string
+	query         string
+	filePattern   string
+	limit         int
+	fetchLimit    int
+}
+
+// resolveLimit applies the default and the hard cap to a caller-supplied limit.
+func resolveLimit(requested int) int {
+	if requested <= 0 {
+		return defaultChunkLimit
+	}
+	return min(requested, maxChunkLimit)
+}
+
+// resolveFetchLimit widens the candidate pool when reranking is enabled so the
+// cross-encoder has more to re-score than the caller ultimately wants back.
+func resolveFetchLimit(limit int, rerankEnabled bool) int {
+	if !rerankEnabled {
+		return limit
+	}
+	return min(max(limit*rerankerOverFetchMultiplier, minRerankerCandidates), maxRerankerCandidates)
+}
+
+// searchVector runs the vector similarity leg, scoped by file pattern when set.
+func searchVector(ctx context.Context, cfg chunkSearchConfig) ([]snowflake.ChunkResult, error) {
+	log := logger.FromContext(ctx)
+	if cfg.filePattern != "" {
+		log.Info("searching snowflake with file filter", "database", cfg.database, "schema", cfg.schema, "table", cfg.table, "filePattern", cfg.filePattern, "limit", cfg.fetchLimit)
+		return snowflake.SearchChunksWithFileFilter(ctx, cfg.oauthToken, cfg.database, cfg.schema, cfg.table, cfg.vectorLiteral, cfg.filePattern, cfg.fetchLimit)
+	}
+	log.Info("searching snowflake", "database", cfg.database, "schema", cfg.schema, "table", cfg.table, "limit", cfg.fetchLimit)
+	return snowflake.SearchChunks(ctx, cfg.oauthToken, cfg.database, cfg.schema, cfg.table, cfg.vectorLiteral, cfg.fetchLimit)
+}
+
+// retrieveChunks runs vector retrieval and optionally reranks the candidates
+// with a cross-encoder.
+func retrieveChunks(ctx context.Context, cfg chunkSearchConfig, rerankerClient reranker.Reranker) ([]snowflake.ChunkResult, error) {
+	log := logger.FromContext(ctx)
+
+	chunks, err := searchVector(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	if rerankerClient != nil && len(chunks) > 0 {
+		reranked, rerankErr := rerankChunks(ctx, rerankerClient, cfg.query, chunks, cfg.limit)
+		if rerankErr != nil {
+			// Reranking is best-effort: the cosine ordering is still valid, and
+			// rerankChunks hands back the untouched candidates.
+			log.Error("reranking failed, returning pre-rerank results", "error", rerankErr)
+		}
+		chunks = reranked
+	}
+
+	if len(chunks) > cfg.limit {
+		chunks = chunks[:cfg.limit]
+	}
+
+	return chunks, nil
+}
+
 func formatVectorLiteral(vec []float64) string {
 	parts := make([]string, len(vec))
 	for i, v := range vec {
@@ -198,4 +296,67 @@ func convertFileGlobToSQL(glob string) string {
 	pattern := strings.ReplaceAll(glob, "%", "\\%")
 	pattern = strings.ReplaceAll(pattern, "_", "\\_")
 	return strings.ReplaceAll(pattern, "*", "%")
+}
+
+// truncateForReranker trims chunk text to the cross-encoder's usable window.
+// Truncation is on a rune boundary so multi-byte characters are never split.
+func truncateForReranker(text string) string {
+	// Byte length is an upper bound on rune count, so this fast path avoids
+	// allocating a rune slice for the common case of short chunks.
+	if len(text) <= maxRerankerDocumentRunes {
+		return text
+	}
+	runes := []rune(text)
+	if len(runes) <= maxRerankerDocumentRunes {
+		return text
+	}
+	return string(runes[:maxRerankerDocumentRunes])
+}
+
+// rerankChunks sends the chunk texts through a cross-encoder reranker,
+// assigns reranker scores, re-sorts by relevance, and truncates to limit.
+func rerankChunks(ctx context.Context, rerankerClient reranker.Reranker, query string, chunks []snowflake.ChunkResult, limit int) ([]snowflake.ChunkResult, error) {
+	log := logger.FromContext(ctx)
+
+	documents := make([]string, len(chunks))
+	for i, chunk := range chunks {
+		documents[i] = truncateForReranker(chunk.ChunkText)
+	}
+
+	results, err := rerankerClient.Rerank(ctx, query, documents, limit)
+	if err != nil {
+		return chunks, fmt.Errorf("calling reranker: %w", err)
+	}
+
+	log.Info("reranking applied", "candidates", len(chunks), "results", len(results))
+
+	seenIndices := make(map[int]bool, len(results))
+	reranked := make([]snowflake.ChunkResult, 0, len(results))
+	for _, result := range results {
+		if result.Index < 0 || result.Index >= len(chunks) {
+			continue
+		}
+		if seenIndices[result.Index] {
+			continue
+		}
+		seenIndices[result.Index] = true
+		chunk := chunks[result.Index]
+		score := result.RelevanceScore
+		chunk.RerankerScore = &score
+		reranked = append(reranked, chunk)
+	}
+
+	if len(reranked) == 0 {
+		return chunks, errors.New("reranker returned no valid results")
+	}
+
+	sort.Slice(reranked, func(i, j int) bool {
+		return *reranked[i].RerankerScore > *reranked[j].RerankerScore
+	})
+
+	if len(reranked) > limit {
+		reranked = reranked[:limit]
+	}
+
+	return reranked, nil
 }

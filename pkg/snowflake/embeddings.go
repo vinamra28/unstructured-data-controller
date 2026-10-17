@@ -22,10 +22,11 @@ import (
 )
 
 type ChunkResult struct {
-	FileID     string `json:"file_id" db:"file_id"`
-	ChunkIndex string `json:"chunk_index" db:"chunk_index"`
-	ChunkText  string `json:"chunk_text" db:"chunk_text"`
-	Score      string `json:"score" db:"score"`
+	FileID        string   `json:"file_id" db:"file_id"`
+	ChunkIndex    string   `json:"chunk_index" db:"chunk_index"`
+	ChunkText     string   `json:"chunk_text" db:"chunk_text"`
+	Score         string   `json:"score" db:"score"`
+	RerankerScore *float64 `json:"reranker_score,omitempty"`
 }
 
 func SearchChunks(
