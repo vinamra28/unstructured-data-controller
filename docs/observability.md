@@ -188,9 +188,26 @@ func RegisterMyTool(s *mcp.Server, metricsProvider *udctelemetry.Provider) {
 }
 ```
 
-Error text recorded on spans is passed through `sanitize()` first, which
-redacts credential material (URL userinfo, bearer tokens, `password=`/`token=`
-pairs) and truncates oversized messages before they reach Datadog or Langfuse.
+### Recording errors on spans
+
+Never call `span.RecordError` directly. Downstream errors routinely embed
+connection strings, query text, or HTTP response bodies, and span attributes
+are exported to Datadog and Langfuse. Use the sanitizing helper instead:
+
+```go
+defer func() {
+    udctelemetry.RecordSpanError(span, err)
+    span.End()
+}()
+```
+
+`RecordSpanError` redacts credential material (URL userinfo including passwords
+containing `@`, bearer/basic tokens, and `password=`/`token=`/`api_key` pairs)
+and truncates oversized messages before marking the span failed. A nil error is
+a no-op, so the call can be deferred unconditionally.
+
+The same sanitization runs inside `ToolObserver` and `RecordExternalCall`, so
+every span this project creates is covered.
 
 ### New pkg/ function with external calls
 

@@ -9,9 +9,9 @@ import (
 	"net/http"
 	"time"
 
+	udctelemetry "github.com/redhat-data-and-ai/unstructured-data-controller/pkg/telemetry"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -99,10 +99,7 @@ func (c *HTTPClient) GenerateEmbeddings(
 			attribute.Int("embedding.input_count", len(inputs)),
 		))
 	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
+		udctelemetry.RecordSpanError(span, err)
 		span.End()
 	}()
 	logger := log.FromContext(ctx)

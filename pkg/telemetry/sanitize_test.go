@@ -17,11 +17,16 @@ limitations under the License.
 package telemetry
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/codes"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
 func TestSanitizeRedactsSecrets(t *testing.T) {
@@ -36,6 +41,22 @@ func TestSanitizeRedactsSecrets(t *testing.T) {
 			input:      "dial failed: postgres://admin:hunter2@db.internal:5432/mydb",
 			mustRedact: []string{"admin", "hunter2"},
 			mustKeep:   []string{"db.internal", "postgres://"},
+		},
+		{
+			// A '@' inside the password must not terminate the match early,
+			// or the tail of the password survives in the exported message.
+			name:       "url password containing an at sign",
+			input:      "dial failed: postgres://admin:pa@ss@db.internal:5432/mydb",
+			mustRedact: []string{"admin", "pa@ss", "ss@db"},
+			mustKeep:   []string{"db.internal", "postgres://"},
+		},
+		{
+			// Whitespace bounds the userinfo match, so an unrelated '@' later
+			// in the message must not be swallowed.
+			name:       "email after a url is not over-redacted",
+			input:      "postgres://u:p@host unreachable, page admin@example.com",
+			mustRedact: []string{"u:p@host"},
+			mustKeep:   []string{"admin@example.com", "unreachable"},
 		},
 		{
 			name:       "bearer token in header dump",
@@ -103,4 +124,46 @@ func TestSanitizeTruncatesLongMessages(t *testing.T) {
 
 func TestSanitizeEmptyMessage(t *testing.T) {
 	assert.Empty(t, sanitize(""))
+}
+
+func TestRecordSpanErrorSanitizesBeforeExport(t *testing.T) {
+	recorder := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	t.Cleanup(func() { require.NoError(t, tp.Shutdown(context.Background())) })
+
+	_, span := tp.Tracer("test").Start(context.Background(), "downstream.call")
+	RecordSpanError(span, errors.New("snowflake dial failed: postgres://svc:hunter2@db:5432/x"))
+	span.End()
+
+	ended := recorder.Ended()
+	require.Len(t, ended, 1)
+
+	require.Equal(t, codes.Error, ended[0].Status().Code)
+	assert.NotContains(t, ended[0].Status().Description, "hunter2",
+		"span status must not carry the raw credential")
+
+	events := ended[0].Events()
+	require.NotEmpty(t, events, "RecordError should add an exception event")
+	for _, event := range events {
+		for _, attr := range event.Attributes {
+			assert.NotContains(t, attr.Value.AsString(), "hunter2",
+				"span event attributes must not carry the raw credential")
+		}
+	}
+}
+
+func TestRecordSpanErrorIgnoresNil(t *testing.T) {
+	recorder := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	t.Cleanup(func() { require.NoError(t, tp.Shutdown(context.Background())) })
+
+	_, span := tp.Tracer("test").Start(context.Background(), "downstream.call")
+	RecordSpanError(span, nil)
+	span.End()
+
+	ended := recorder.Ended()
+	require.Len(t, ended, 1)
+	assert.NotEqual(t, codes.Error, ended[0].Status().Code,
+		"a nil error must leave the span unmarked")
+	assert.Empty(t, ended[0].Events(), "a nil error must not add an exception event")
 }

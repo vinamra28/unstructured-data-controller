@@ -19,9 +19,9 @@ package snowflake
 import (
 	"context"
 
+	udctelemetry "github.com/redhat-data-and-ai/unstructured-data-controller/pkg/telemetry"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -35,10 +35,7 @@ func ShowDatabases(ctx context.Context, oauthToken string) (result []DatabaseInf
 		trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithAttributes(attribute.String("db.system", "snowflake")))
 	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
+		udctelemetry.RecordSpanError(span, err)
 		span.End()
 	}()
 	return queryRows[DatabaseInfo](ctx, oauthToken, "SHOW DATABASES;")

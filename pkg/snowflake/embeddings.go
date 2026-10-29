@@ -20,9 +20,9 @@ import (
 	"context"
 	"fmt"
 
+	udctelemetry "github.com/redhat-data-and-ai/unstructured-data-controller/pkg/telemetry"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -40,10 +40,7 @@ func SearchChunks(
 		trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithAttributes(attribute.String("db.system", "snowflake"), attribute.String("db.name", database)))
 	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
+		udctelemetry.RecordSpanError(span, err)
 		span.End()
 	}()
 	query := fmt.Sprintf(

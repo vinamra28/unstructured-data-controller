@@ -21,9 +21,9 @@ import (
 	"fmt"
 	"os"
 
+	udctelemetry "github.com/redhat-data-and-ai/unstructured-data-controller/pkg/telemetry"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 
 	operatorv1alpha1 "github.com/redhat-data-and-ai/unstructured-data-controller/api/v1alpha1"
@@ -72,10 +72,7 @@ func (c *Client) ListPipelines(ctx context.Context) (_ []PipelineInfo, err error
 	ctx, span := otel.Tracer("pkg/k8sclient").Start(ctx, "k8s.list_pipelines",
 		trace.WithSpanKind(trace.SpanKindClient))
 	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
+		udctelemetry.RecordSpanError(span, err)
 		span.End()
 	}()
 
@@ -116,10 +113,7 @@ func (c *Client) GetPipelineQueryConfig(
 			attribute.String("stage.type", string(stageType)),
 		))
 	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
+		udctelemetry.RecordSpanError(span, err)
 		span.End()
 	}()
 	pipeline := &operatorv1alpha1.UnstructuredDataPipeline{}

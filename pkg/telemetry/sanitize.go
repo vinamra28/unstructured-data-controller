@@ -16,7 +16,13 @@ limitations under the License.
 
 package telemetry
 
-import "regexp"
+import (
+	"errors"
+	"regexp"
+
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+)
 
 // maxMessageLen caps sanitized messages. Snowflake and HTTP clients can return
 // multi-kilobyte errors containing full query text or response bodies; span
@@ -31,7 +37,13 @@ const redacted = "[REDACTED]"
 // in Datadog and Langfuse, so these are stripped before export.
 var secretPatterns = []*regexp.Regexp{
 	// Credentials in a URL userinfo section: scheme://user:password@host
-	regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://)[^/\s:@]+:[^/\s@]+@`),
+	//
+	// Both userinfo parts use [^/\s]* rather than excluding '@'. A password
+	// may itself contain '@', and stopping at the first one would leave the
+	// remainder of the password in the message. Greedy matching consumes
+	// through the last '@' of the userinfo; '/' and whitespace still bound
+	// the match so a later unrelated '@' (an email address, say) is safe.
+	regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://)[^/\s]*:[^/\s]*@`),
 	// Authorization header values: "Bearer abc123", "Basic dXNlcjpwYXNz"
 	regexp.MustCompile(`(?i)\b(bearer|basic)\s+[A-Za-z0-9\-._~+/=]+`),
 	// key=value and key: value pairs for sensitive key names. The optional
@@ -60,4 +72,19 @@ func sanitize(msg string) string {
 		return msg[:maxMessageLen] + "...[truncated]"
 	}
 	return msg
+}
+
+// RecordSpanError marks span as failed with a sanitized form of err.
+//
+// Use this instead of calling span.RecordError directly. Errors from
+// downstream clients routinely embed connection strings, query text, or HTTP
+// response bodies, and span attributes are exported to Datadog and Langfuse.
+// Passing a nil err is a no-op so callers can defer this unconditionally.
+func RecordSpanError(span trace.Span, err error) {
+	if err == nil {
+		return
+	}
+	safeMsg := sanitize(err.Error())
+	span.RecordError(errors.New(safeMsg))
+	span.SetStatus(codes.Error, safeMsg)
 }
