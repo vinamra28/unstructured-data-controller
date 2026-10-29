@@ -26,9 +26,12 @@ import (
 	"strings"
 	"time"
 
+	udctelemetry "github.com/redhat-data-and-ai/unstructured-data-controller/pkg/telemetry"
 	"github.com/snowflakedb/gosnowflake"
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	semconv "go.opentelemetry.io/otel/semconv/v1.41.0"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const maxQueryRetries = 3
@@ -147,7 +150,27 @@ func queryRows[T any](ctx context.Context, oauthToken, query string, args ...any
 }
 
 // executeQuery runs a single query attempt: open connection, query, scan, close.
-func executeQuery[T any](ctx context.Context, oauthToken, query string, args ...any) ([]T, error) {
+func executeQuery[T any](ctx context.Context, oauthToken, query string, args ...any) (_ []T, err error) {
+	// One span per attempt rather than one per call. queryRows retries up to
+	// maxQueryRetries with backoff, so without this a 9s parent span is
+	// indistinguishable from a single slow query and from three fast failures
+	// plus waiting.
+	//
+	// This is also the only database span the file-filter functions get:
+	// SearchChunksWithFileFilter, CountProcessedDocumentsByFilePath,
+	// ListFileIDsByFilePath and GetProcessedDocumentsByFilePath have no span of
+	// their own, and all of them reach Snowflake through here.
+	//
+	// The query text is deliberately not recorded: it carries table names and
+	// bound values, and spans leave the process for Datadog and Langfuse.
+	ctx, span := otel.Tracer("pkg/snowflake").Start(ctx, "snowflake.query",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(dbSpanAttributes("")...))
+	defer func() {
+		udctelemetry.RecordSpanError(span, err)
+		span.End()
+	}()
+
 	db, err := openConnection(oauthToken)
 	if err != nil {
 		return nil, err

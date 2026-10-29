@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"os"
@@ -180,7 +181,9 @@ func main() {
 
 	go func() {
 		slog.Info("MCP server starting", "addr", addr, "endpoint", "/mcp")
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		// errors.Is rather than ==: any future wrapping of the sentinel would
+		// otherwise turn a normal shutdown into a non-zero exit.
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("server failed to start", "error", err)
 			os.Exit(1)
 		}
@@ -188,9 +191,13 @@ func main() {
 
 	go func() {
 		slog.Info("metrics server starting", "addr", metricsAddr)
-		if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			slog.Error("metrics server failed to start", "error", err)
-			os.Exit(1)
+		// An observability endpoint that cannot bind must not take down a
+		// healthy server: /mcp, OAuth and /healthz are unaffected by it. An
+		// os.Exit here would also bypass the graceful shutdown below, cutting
+		// live SSE sessions mid-stream over a port conflict. Telemetry still
+		// reaches an OTLP collector when one is configured.
+		if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("metrics server stopped; Prometheus scraping is unavailable", "error", err)
 		}
 	}()
 

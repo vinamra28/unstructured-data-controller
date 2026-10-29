@@ -19,6 +19,7 @@ package telemetry
 import (
 	"errors"
 	"regexp"
+	"unicode/utf8"
 
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
@@ -70,10 +71,18 @@ var secretRules = []struct {
 		// quote after the key name covers JSON bodies ("api_key": "...") as well
 		// as bare connection-string and query-parameter forms (password=...).
 		//
+		// The [\w.-]* prefix is what catches the compound names that actually
+		// appear in OAuth, SSO and AWS error bodies: access_token,
+		// client_secret, refresh_token, aws_secret_access_key, x-api-key. A
+		// plain \b before the alternation cannot match any of them, because
+		// '_' is a word character so there is no boundary before "token" in
+		// "access_token". The prefix is inside group 1 so the full key name
+		// survives redaction.
+		//
 		// The key name and separator are kept so a reader can tell which
 		// credential the message was carrying; only the value is replaced.
 		pattern: regexp.MustCompile(
-			`(?i)\b(password|passwd|token|secret|api[_-]?key|access[_-]?key|private[_-]?key|credential)` +
+			`(?i)\b([\w.-]*(?:password|passwd|token|secret|api[_-]?key|access[_-]?key|private[_-]?key|credential))` +
 				`("?\s*[=:]\s*)("[^"]*"|'[^']*'|[^\s,;&)}]+)`),
 		replacement: "${1}${2}" + redacted,
 	},
@@ -87,7 +96,17 @@ func sanitize(msg string) string {
 	}
 
 	if len(msg) > maxMessageLen {
-		return msg[:maxMessageLen] + "...[truncated]"
+		// Back off to a rune boundary. Cutting mid-rune yields invalid UTF-8,
+		// which protobuf rejects for proto3 string fields; the OTLP exporter
+		// then fails the whole export and the batch processor drops every span
+		// in the batch, not just the one carrying this message. Crawled Drive
+		// and Git content makes non-ASCII error text routine. At most three
+		// continuation bytes are skipped.
+		limit := maxMessageLen
+		for limit > 0 && !utf8.RuneStart(msg[limit]) {
+			limit--
+		}
+		return msg[:limit] + "...[truncated]"
 	}
 	return msg
 }

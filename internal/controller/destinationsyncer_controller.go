@@ -131,12 +131,19 @@ func (r *DestinationSyncerReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		}
 		logger.Info("files to ingest to destination", "stage", dep.Name, "count", len(filePaths))
 
-		if err := destination.SyncFilesToDestination(ctx, r.fileStore, filePaths); err != nil {
+		// uploadedCount is the delta, not len(filePaths): files already present
+		// at the destination with a matching checksum are skipped. Counting the
+		// listing instead would add the whole corpus on every reconcile, so
+		// udc.files.processed would mean something different here than it does
+		// in the other controllers, which all record true deltas.
+		uploadedCount, err := destination.SyncFilesToDestination(ctx, r.fileStore, filePaths)
+		if err != nil {
 			logger.Error(err, "failed to ingest files to destination", "stage", dep.Name)
 			return r.handleError(ctx, destinationSyncCR, err)
 		}
-		totalFilesSynced += int64(len(filePaths))
-		logger.Info("successfully ingested files to destination", "stage", dep.Name)
+		totalFilesSynced += int64(uploadedCount)
+		logger.Info("successfully ingested files to destination",
+			"stage", dep.Name, "uploaded", uploadedCount, "listed", len(filePaths))
 	}
 
 	successMessage := fmt.Sprintf("successfully reconciled destination sync: %s", destinationSyncCR.Name)

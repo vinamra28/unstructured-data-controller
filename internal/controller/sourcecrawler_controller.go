@@ -163,6 +163,11 @@ func (r *SourceCrawlerReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			logger.Error(err, "failed to update SourceCrawler CR status")
 			return ctrl.Result{}, r.handleError(ctx, sourceCrawlerCR, err)
 		}
+		// Git returns below instead of falling through to the shared success
+		// path, so it has to record its own count. Without this the metric
+		// stays 0 forever for Git-backed pipelines while .status.filesProcessed
+		// climbs, making the crawler look dead during an incident.
+		r.Metrics.RecordFilesProcessed(ctx, SourceCrawlerControllerName, int64(len(storedFiles)))
 
 		interval := defaultGitPollInterval
 		if sourceCrawlerConfig.GitConfig.PollInterval != nil && sourceCrawlerConfig.GitConfig.PollInterval.Duration > 0 {
@@ -191,13 +196,19 @@ func (r *SourceCrawlerReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			sourceCrawlerCR.Status.GDriveStatus = gdriveStatus
 		}); patchErr != nil {
 			logger.Error(patchErr, "failed to update SourceCrawler CR status with gdrive status")
+		} else {
+			// A partial sync still stored storedCount files, and the status
+			// field above was just incremented by the same number, so the
+			// metric has to follow or the two disagree. Recorded only when the
+			// patch succeeded, so a retry after a failed patch cannot
+			// double-count.
+			r.Metrics.RecordFilesProcessed(ctx, SourceCrawlerControllerName, storedCount)
 		}
 		return ctrl.Result{}, r.handleError(ctx, sourceCrawlerCR, fmt.Errorf("failed to store files to filestore: %w", err))
 	}
 	logger.Info("successfully stored files to filestore", "count", len(storedFiles))
 
 	successMessage := fmt.Sprintf("successfully reconciled source crawler: %s", sourceCrawlerCR.Name)
-	storedCount = int64(len(storedFiles))
 	if err := controllerutils.StatusPatch(ctx, r.Client, sourceCrawlerCR, func() {
 		sourceCrawlerCR.Status.FilesProcessed += storedCount
 		sourceCrawlerCR.Status.GDriveStatus = gdriveStatus

@@ -21,6 +21,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -87,6 +88,40 @@ func TestSanitizeRedactsSecrets(t *testing.T) {
 			input:      "GET /v1/embed?token=abcd1234&model=nomic returned 500",
 			mustRedact: []string{"abcd1234"},
 			mustKeep:   []string{"model=nomic", "returned 500"},
+		},
+		{
+			// Underscore-prefixed key names are the common case in OAuth and
+			// SSO error bodies, and this server is OAuth-authenticated. '_' is
+			// a word character, so a plain \b before the key alternation
+			// cannot match any of these.
+			name:       "oauth access_token in a json body",
+			input:      `token exchange failed: {"access_token":"ya29.SECRETVALUE","expires_in":3599}`,
+			mustRedact: []string{"ya29.SECRETVALUE"},
+			mustKeep:   []string{"token exchange failed", "expires_in"},
+		},
+		{
+			name:       "oauth client_secret",
+			input:      "sso rejected: client_id=udc client_secret=supersecret123",
+			mustRedact: []string{"supersecret123"},
+			mustKeep:   []string{"client_id=udc"},
+		},
+		{
+			name:       "oauth refresh_token with colon separator",
+			input:      "refresh failed: refresh_token: rt_abcdef123456",
+			mustRedact: []string{"rt_abcdef123456"},
+			mustKeep:   []string{"refresh failed"},
+		},
+		{
+			name:       "aws secret access key",
+			input:      "sts error: aws_secret_access_key=wJalrXUtnFEMI/K7MDENG host=s3",
+			mustRedact: []string{"wJalrXUtnFEMI/K7MDENG"},
+			mustKeep:   []string{"host=s3"},
+		},
+		{
+			name:       "hyphenated header style key",
+			input:      "upstream rejected: x-api-key=sk-live-9f8e7d",
+			mustRedact: []string{"sk-live-9f8e7d"},
+			mustKeep:   []string{"upstream rejected"},
 		},
 	}
 
@@ -159,6 +194,25 @@ func TestSanitizeProducesExactOutput(t *testing.T) {
 			input:    "token=aaa and password=bbb",
 			expected: "token=[REDACTED] and password=[REDACTED]",
 		},
+		{
+			// The full compound key is kept, not just the matched suffix, so
+			// the reader can still tell which credential it was.
+			name:     "compound key name survives redaction",
+			input:    `{"access_token":"ya29.SECRET"}`,
+			expected: `{"access_token":[REDACTED]}`,
+		},
+		{
+			name:     "aws style key keeps its prefix",
+			input:    "aws_secret_access_key=AKIAEXAMPLE",
+			expected: "aws_secret_access_key=[REDACTED]",
+		},
+		{
+			// A key that merely contains a sensitive word but does not end in
+			// one is not a credential and must be left alone.
+			name:     "non credential key is untouched",
+			input:    "token_count=42",
+			expected: "token_count=42",
+		},
 	}
 
 	for _, testCase := range tests {
@@ -185,6 +239,39 @@ func TestSanitizeTruncatesLongMessages(t *testing.T) {
 
 func TestSanitizeEmptyMessage(t *testing.T) {
 	assert.Empty(t, sanitize(""))
+}
+
+// TestSanitizeTruncatesOnARuneBoundary guards the OTLP export path: protobuf
+// rejects invalid UTF-8 in proto3 string fields, and the batch processor drops
+// the entire batch on an export failure, not just the offending span. This
+// operator crawls Drive and Git, so non-ASCII error text is routine.
+func TestSanitizeTruncatesOnARuneBoundary(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{name: "japanese", input: strings.Repeat("日本語テキスト", 100)},
+		{name: "emoji", input: strings.Repeat("🙂", 200)},
+		{name: "accented latin", input: strings.Repeat("café-résumé-", 60)},
+		{name: "mixed ascii and multibyte", input: strings.Repeat("path/到/文件/", 50)},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			got := sanitize(testCase.input)
+
+			require.True(t, utf8.ValidString(got),
+				"truncated message must stay valid UTF-8 or the whole span batch is dropped")
+			assert.True(t, strings.HasSuffix(got, "...[truncated]"))
+			// Back-off never drops more than the 3 continuation bytes of one rune.
+			assert.Greater(t, len(got), maxMessageLen-4+len("...[truncated]"))
+		})
+	}
+}
+
+func TestSanitizeKeepsShortMultibyteMessagesIntact(t *testing.T) {
+	msg := "ドキュメント処理に失敗しました"
+	assert.Equal(t, msg, sanitize(msg))
 }
 
 func TestRecordSpanErrorSanitizesBeforeExport(t *testing.T) {

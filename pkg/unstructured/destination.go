@@ -18,7 +18,12 @@ import (
 )
 
 type Destination interface {
-	SyncFilesToDestination(ctx context.Context, fs *filestore.FileStore, filePaths []string) error
+	// SyncFilesToDestination uploads filePaths and returns how many were
+	// actually written. Files already present at the destination with a
+	// matching checksum are skipped, so the count is a true delta rather than
+	// len(filePaths). On error the count covers the uploads that completed
+	// before the failure.
+	SyncFilesToDestination(ctx context.Context, fs *filestore.FileStore, filePaths []string) (int, error)
 }
 
 // S3Destination syncs files to an S3 bucket at prefix/stages/<stageName>/.
@@ -47,8 +52,12 @@ func (d *S3Destination) s3Key(filePath string) string {
 }
 
 func (d *S3Destination) SyncFilesToDestination(ctx context.Context, fs *filestore.FileStore,
-	chunksFilePaths []string) error {
+	chunksFilePaths []string) (int, error) {
 	logger := log.FromContext(ctx)
+	// uploaded counts files actually written, not files considered: unchanged
+	// files are skipped below, so len(chunksFilePaths) would report the whole
+	// corpus on every reconcile even when nothing moved.
+	uploaded := 0
 	destPrefix := filepath.Join(d.Prefix, "stages", d.StageName) + "/"
 	if filepath.Separator != '/' {
 		destPrefix = filepath.ToSlash(destPrefix)
@@ -66,7 +75,7 @@ func (d *S3Destination) SyncFilesToDestination(ctx context.Context, fs *filestor
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
-			return fmt.Errorf("list objects s3://%s prefix %q: %w", d.Bucket, destPrefix, err)
+			return uploaded, fmt.Errorf("list objects s3://%s prefix %q: %w", d.Bucket, destPrefix, err)
 		}
 		for _, obj := range page.Contents {
 			if obj.Key != nil {
@@ -79,7 +88,7 @@ func (d *S3Destination) SyncFilesToDestination(ctx context.Context, fs *filestor
 		data, err := fs.Retrieve(ctx, chunksFilePath)
 		if err != nil {
 			logger.Error(err, "failed to retrieve file from filestore", "file", chunksFilePath)
-			return fmt.Errorf("retrieve %s: %w", chunksFilePath, err)
+			return uploaded, fmt.Errorf("retrieve %s: %w", chunksFilePath, err)
 		}
 
 		key := d.s3Key(chunksFilePath)
@@ -101,7 +110,7 @@ func (d *S3Destination) SyncFilesToDestination(ctx context.Context, fs *filestor
 			if notFoundErr.ErrorCode() != "NotFound" {
 				logger.Info("error while fetching the object",
 					"key", key, "error", err.Error())
-				return err
+				return uploaded, err
 			}
 		}
 
@@ -120,8 +129,9 @@ func (d *S3Destination) SyncFilesToDestination(ctx context.Context, fs *filestor
 		})
 		if err != nil {
 			logger.Error(err, "failed to upload file to S3", "bucket", d.Bucket, "key", key)
-			return fmt.Errorf("put object s3://%s/%s: %w", d.Bucket, key, err)
+			return uploaded, fmt.Errorf("put object s3://%s/%s: %w", d.Bucket, key, err)
 		}
+		uploaded++
 		logger.Info("uploaded file to S3 destination", "key", key)
 	}
 
@@ -134,9 +144,9 @@ func (d *S3Destination) SyncFilesToDestination(ctx context.Context, fs *filestor
 		})
 		if err != nil {
 			logger.Error(err, "failed to delete file from S3 destination", "key", key)
-			return fmt.Errorf("delete object s3://%s/%s: %w", d.Bucket, key, err)
+			return uploaded, fmt.Errorf("delete object s3://%s/%s: %w", d.Bucket, key, err)
 		}
 	}
 
-	return nil
+	return uploaded, nil
 }

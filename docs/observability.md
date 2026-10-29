@@ -1,22 +1,30 @@
 # Observability
 
-The Unstructured Data Controller and MCP Server include built-in observability via [OpenTelemetry](https://opentelemetry.io/). Both binaries expose metrics through a Prometheus-compatible `/metrics` endpoint and can optionally push telemetry to an OTel Collector via OTLP gRPC.
+The Unstructured Data Controller and MCP Server include built-in observability via [OpenTelemetry](https://opentelemetry.io/). Telemetry is pushed to an OTel Collector over OTLP gRPC, which fans out to Datadog, Langfuse, or any OTLP backend.
 
 ## How It Works
 
-Both binaries use the shared `pkg/telemetry` package which initializes the OTel SDK with dual export:
+Both binaries use the shared `pkg/telemetry` package, which initializes the OTel SDK with two export paths. They differ in which one is actually reachable today:
 
-- **Prometheus export (always on)** -- custom metrics are served on a `/metrics` HTTP endpoint in Prometheus format. For the controller, they appear alongside controller-runtime's built-in metrics (work queue depth, reconcile counts, etc.). For the MCP server, a dedicated `/metrics` endpoint is exposed on a separate port (8000) to isolate it from the MCP protocol traffic on port 8080.
+- **OTLP push** -- when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, metrics and traces go to an OTel Collector over gRPC. This is the delivery path for both binaries.
 
-- **OTLP push (opt-in)** -- when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, metrics and traces are pushed to an OTel Collector via gRPC. The collector can then forward to any backend (Datadog, Langfuse, Jaeger, etc.).
+- **Prometheus pull** -- the SDK always builds a Prometheus exporter, but only the MCP server serves it, on a dedicated port (8000, HTTP) kept separate from the MCP protocol traffic on 8080. **The controller does not currently expose a metrics endpoint**: `--metrics-bind-address` is left at its default of `0`, so its `udc_*` instruments are registered on controller-runtime's registry but nothing serves them. Exposing the controller's endpoint is deliberately left to a follow-up change; until then, set `OTEL_EXPORTER_OTLP_ENDPOINT` or the controller emits nothing.
 
 ```
-Controller ──┐                              ┌── Datadog
-             ├── OTLP gRPC ──> OTel Collector ──> Langfuse
-MCP Server ──┘                              └── (any OTLP backend)
-             │
-             └── /metrics ──> Prometheus / any scraper
+Controller ── OTLP/gRPC ─┐                      ┌── Datadog   (metrics + traces)
+                         ├── OTel Collector ────┤
+MCP Server ── OTLP/gRPC ─┘                      └── Langfuse  (traces, via HTTP)
+
+MCP Server ── /metrics :8000 ──> Prometheus / any scraper
 ```
+
+### Routing to Datadog and Langfuse
+
+Both binaries speak OTLP/gRPC to a collector; the collector fans out to backends. Two things are worth knowing before wiring this up.
+
+**Langfuse consumes traces, not metrics.** It is an LLM-observability backend, so what it renders is the MCP server's tool spans and their children (embedding, Snowflake, K8s). The MCP server samples at 1.0 for exactly this reason. Its native OTLP ingest is HTTP/protobuf, and only gRPC exporters are compiled in here, so Langfuse has to sit behind a collector -- point the app at the collector over gRPC and let the collector's exporter talk HTTP to Langfuse. Direct app-to-Langfuse will not connect.
+
+**Only `udc_*` metrics travel over OTLP.** controller-runtime's own metrics -- reconcile totals, workqueue depth and latency, client request counts -- are native Prometheus collectors on its registry, not OTel instruments, so the OTLP exporter never sees them. Workqueue depth is usually the first thing you want in Datadog when a controller stalls, and it is not currently reachable by any path: the controller serves no metrics endpoint for a collector to scrape. Getting those into Datadog needs the follow-up that exposes the endpoint, plus a `prometheus` receiver on the collector alongside the OTLP one.
 
 ## Configuration
 
@@ -54,7 +62,13 @@ OTEL_EXPORTER_OTLP_INSECURE: "true"
 
 ### Prometheus scraping
 
-The controller's metrics endpoint is managed by controller-runtime (port 8443, HTTPS with authn/authz). See the [kubebuilder metrics reference](https://book.kubebuilder.io/reference/metrics) for configuration.
+**The controller has no metrics endpoint to scrape.** `--metrics-bind-address` is left at its default of `0`, so controller-runtime serves nothing and neither the `udc_*` instruments nor controller-runtime's own metrics are readable by pull. OTLP push is the controller's only delivery path today. Exposing the endpoint is a planned follow-up; it needs more than flipping the flag:
+
+- The scaffolded `config/default/manager_metrics_patch.yaml` inserts the flag at `args[0]`, **ahead of** `/manager`. This image's ENTRYPOINT is `entrypoint.sh`, which ends in `exec "$@"`, so `args[0]` is the binary to exec. Applying that patch as written makes the flag the command and the pod CrashLoopBackOffs. The flag has to be appended, not prepended.
+- `config/deploy` (what `make deploy` builds) pulls in only `../rbac` and `../manager`, so it picks up neither that patch nor `config/default/metrics_service.yaml`.
+- `--metrics-secure` defaults to true, so a scraper needs a bearer token plus `metrics_auth_role.yaml`, `metrics_auth_role_binding.yaml` and `metrics_reader_role.yaml` uncommented in `config/rbac/kustomization.yaml`. Those are cluster-scoped (`TokenReview`/`SubjectAccessReview`), a wider grant than the rest of this operator's namespace-scoped RBAC, so that is a deliberate decision rather than a default.
+
+See the [kubebuilder metrics reference](https://book.kubebuilder.io/reference/metrics).
 
 The MCP server's `/metrics` endpoint is on a dedicated port 8000 (HTTP, unauthenticated), isolated from the MCP protocol on port 8080. The deployment includes standard Prometheus scrape annotations:
 
@@ -120,13 +134,17 @@ mcp.tool/get_chunks_for_embeddings       [root, attrs: mcp.pipeline_name]
   |-- k8s.get_pipeline_query_config      [attrs: pipeline.name, stage.type]
   |-- embedding.generate                 [attrs: embedding.model, embedding.input_count]
   |-- snowflake.search_chunks            [attrs: db.system.name, db.namespace]
+        |-- snowflake.query              [one per attempt]
 ```
+
+With a `file_path_filter`, the handler calls `SearchChunksWithFileFilter`, which has no named span of its own; the `snowflake.query` span appears directly under the tool span instead.
 
 **list_unstructured_data_pipelines_for_user:**
 ```
 mcp.tool/list_unstructured_data_pipelines_for_user   [root]
   |-- k8s.list_pipelines
   |-- snowflake.show_databases           [attrs: db.system.name]
+        |-- snowflake.query              [one per attempt]
 ```
 
 **get_processed_document:**
@@ -134,7 +152,10 @@ mcp.tool/list_unstructured_data_pipelines_for_user   [root]
 mcp.tool/get_processed_document          [root, attrs: mcp.pipeline_name, mcp.file_id]
   |-- k8s.get_pipeline_query_config      [attrs: pipeline.name, stage.type]
   |-- snowflake.get_processed_document   [attrs: db.system.name, db.namespace]
+        |-- snowflake.query              [one per attempt]
 ```
+
+Every Snowflake call goes through `queryRows`, which retries up to three times with backoff, and each attempt gets its own `snowflake.query` span. Three of them under one parent means the query failed twice and the parent's duration is mostly backoff, not database time. The query text is not recorded: it carries table names and bound values, and spans leave the process.
 
 Traces are useful for Langfuse integration (LLM observability) and debugging latency in the tool call chain.
 
@@ -316,7 +337,7 @@ make test
 
 ## Architecture Decisions
 
-**Why OTel SDK instead of Prometheus client?** The project needs to support both pull (Prometheus scraping for OSS users) and push (OTLP to OTel Collector for Datadog/Langfuse). The OTel SDK supports both via its Prometheus exporter and OTLP exporter. This follows the same pattern as [Tekton](https://tekton.dev/) and [Knative](https://knative.dev/), which are the only major Kubernetes projects that use the OTel SDK natively.
+**Why OTel SDK instead of Prometheus client?** The project needs to support both pull (Prometheus scraping for OSS users) and push (OTLP to OTel Collector for Datadog/Langfuse). The OTel SDK supports both via its Prometheus exporter and OTLP exporter, which is what keeps the controller's pull path a configuration change rather than a reinstrumentation. This follows the same pattern as [Tekton](https://tekton.dev/) and [Knative](https://knative.dev/), which are the only major Kubernetes projects that use the OTel SDK natively.
 
 **Why not the Prometheus-to-OTel bridge?** The bridge adds app-side overhead and silently drops Summary metrics. Since this is a new instrumentation effort (no existing Prometheus metrics to migrate), writing directly against the OTel SDK avoids the translation layer entirely. Controller-runtime's built-in Prometheus metrics remain on the `/metrics` endpoint as-is.
 

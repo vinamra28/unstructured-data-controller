@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package metrics provides OpenTelemetry SDK initialization with dual export:
+// Package telemetry provides OpenTelemetry SDK initialization with dual export:
 // OTLP push (for collectors like Datadog/Langfuse) and Prometheus pull (for OSS scraping).
 package telemetry
 
