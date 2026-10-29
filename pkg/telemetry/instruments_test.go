@@ -284,6 +284,45 @@ func TestRecordExternalCallWithError(t *testing.T) {
 	assert.Greater(t, hist.DataPoints[0].Sum, 0.0)
 }
 
+// TestRecordExternalCallSplitsByOutcome pins the attribute that makes this
+// histogram alertable. It is the only external-call instrument - there is no
+// call counter and no error counter - so without an outcome the failure rate
+// of Snowflake, the embedding API and K8s is absent from metrics entirely,
+// and a dependency failing fast would improve p99.
+func TestRecordExternalCallSplitsByOutcome(t *testing.T) {
+	p, reader := setupTestProvider(t)
+	defer func() {
+		require.NoError(t, p.meterProvider.Shutdown(context.Background()))
+	}()
+
+	ctx := context.Background()
+	p.RecordExternalCall(ctx, "snowflake", "search_chunks", 100*time.Millisecond, nil)
+	p.RecordExternalCall(ctx, "snowflake", "search_chunks", 20*time.Millisecond,
+		errors.New("connection timeout"))
+
+	rm := collectMetrics(t, reader)
+	hist := requireHistogramMetric(t, rm, "udc.mcp.external.duration")
+
+	// Same service and operation, so the outcome is what separates them.
+	require.Len(t, hist.DataPoints, 2,
+		"success and error should land in separate series")
+
+	byOutcome := map[string]uint64{}
+	for _, dataPoint := range hist.DataPoints {
+		value, ok := dataPoint.Attributes.Value(attribute.Key("outcome"))
+		require.True(t, ok, "every data point should carry an outcome attribute")
+		byOutcome[value.AsString()] = dataPoint.Count
+	}
+
+	assert.Equal(t, uint64(1), byOutcome["success"])
+	assert.Equal(t, uint64(1), byOutcome["error"])
+}
+
+func TestCallOutcome(t *testing.T) {
+	assert.Equal(t, "success", callOutcome(nil))
+	assert.Equal(t, "error", callOutcome(errors.New("boom")))
+}
+
 // A nil Provider is the "telemetry disabled" case. Callers invoke these
 // methods without nil guards, so every one must tolerate a nil receiver.
 func TestNilProviderIsSafe(t *testing.T) {

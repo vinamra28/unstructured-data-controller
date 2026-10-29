@@ -27,9 +27,29 @@ import (
 	"time"
 
 	"github.com/snowflakedb/gosnowflake"
+	"go.opentelemetry.io/otel/attribute"
+	semconv "go.opentelemetry.io/otel/semconv/v1.41.0"
 )
 
 const maxQueryRetries = 3
+
+// dbSpanAttributes returns the semantic-convention attributes shared by every
+// Snowflake client span. Pass an empty database for calls that are not scoped
+// to one, such as SHOW DATABASES.
+//
+// The keys come from the semconv package rather than string literals so that
+// a future convention bump surfaces as a compile error instead of silently
+// mislabelling spans: db.system and db.name were renamed to db.system.name
+// and db.namespace, and APM database views key off the current names.
+func dbSpanAttributes(database string) []attribute.KeyValue {
+	// semconv v1.41.0 has no enum value for Snowflake, so the value stays a
+	// literal while the key stays pinned to the convention.
+	attrs := []attribute.KeyValue{semconv.DBSystemNameKey.String("snowflake")}
+	if database != "" {
+		attrs = append(attrs, semconv.DBNamespace(database))
+	}
+	return attrs
+}
 
 func openConnection(oauthToken string) (*sql.DB, error) {
 	account := os.Getenv("SNOWFLAKE_ACCOUNT")

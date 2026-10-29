@@ -91,10 +91,6 @@ linters:
         path: test/
         text: "var-naming"
       - linters:
-          - unparam
-        path: internal/controller/
-        text: "handleError"
-      - linters:
           - revive
         path: ^test/
         text: "unsecure-url-scheme"

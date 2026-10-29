@@ -70,8 +70,7 @@ type SourceCrawlerReconciler struct {
 // +kubebuilder:rbac:groups=operator.dataverse.redhat.com,namespace=unstructured-controller-namespace,resources=sourcecrawlers/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",namespace=unstructured-controller-namespace,resources=secrets,verbs=get;list;watch
 
-func (r *SourceCrawlerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, retErr error) {
-	defer r.Metrics.ReconcileObserver(SourceCrawlerControllerName).End(ctx, &retErr)
+func (r *SourceCrawlerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	logger.Info("reconciling", "controller", SourceCrawlerControllerName)
 
@@ -605,5 +604,5 @@ func (r *SourceCrawlerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&operatorv1alpha1.DestinationSyncer{}, handler.EnqueueRequestsFromMapFunc(r.findDependents), builder.WithPredicates(controllerutils.FilesProcessedChangedPredicate{})).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.findSecretDependents)).
 		Named("sourcecrawler").
-		Complete(r)
+		Complete(r.Metrics.ObserveReconciler(SourceCrawlerControllerName, r))
 }

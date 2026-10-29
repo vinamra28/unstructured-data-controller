@@ -133,11 +133,10 @@ func newInstruments(mp metric.MeterProvider) (*instruments, error) {
 }
 
 // ReconcileObserver captures the start time and controller name for a reconcile loop.
-// Use with named returns and defer:
 //
-//	func (r *MyReconciler) Reconcile(ctx, req) (result, retErr) {
-//	    obs := metricsProvider.ReconcileObserver("MyController")
-//	    defer obs.End(ctx, &retErr)
+// Reconcilers do not use this directly: ObserveReconciler wraps the whole
+// Reconciler, which keeps telemetry out of the reconcile bodies and lets a
+// panicking reconcile be counted. This is the recording primitive behind it.
 type ReconcileObserver struct {
 	instruments    *instruments
 	controllerName string
@@ -194,8 +193,9 @@ func (p *Provider) RecordFilesProcessed(ctx context.Context, controllerName stri
 // Pass an empty string on success. Callers that only have an error result
 // without a machine-readable error should pass the user-facing message.
 //
-//	ctx, endTool := metricsProvider.ToolObserver(ctx, "get_chunks_for_embeddings")
-//	defer func() { endTool(toolFailureCause(res)) }()
+// Tool handlers do not use this directly: the MCP server installs
+// tools.TelemetryMiddleware, which calls this once per invocation with the
+// registered tool name. This is the recording primitive behind it.
 func (p *Provider) ToolObserver(
 	ctx context.Context, toolName string, spanAttrs ...attribute.KeyValue,
 ) (context.Context, func(cause string)) {
@@ -227,6 +227,15 @@ func (p *Provider) ToolObserver(
 	}
 }
 
+// callOutcome labels a recorded call so latency can be split by result.
+// Bounded to two values, so it does not meaningfully add cardinality.
+func callOutcome(err error) string {
+	if err != nil {
+		return "error"
+	}
+	return "success"
+}
+
 // RecordExternalCall records the duration of an external service call and, on error,
 // marks the current span with the error. Used in MCP tool handlers to time
 // calls to K8s, Snowflake, and embedding services.
@@ -237,9 +246,14 @@ func (p *Provider) RecordExternalCall(
 	if p == nil {
 		return
 	}
+	// outcome is what makes this histogram usable for alerting. It is the only
+	// external-call instrument - there is no call counter and no error counter
+	// - so without it a failing dependency is invisible in metrics, and worse,
+	// a dependency that fails fast lowers p99 and leaves a latency SLO green.
 	attrs := metric.WithAttributes(
 		attribute.String("service", service),
 		attribute.String("operation", operation),
+		attribute.String("outcome", callOutcome(err)),
 	)
 	p.instruments.externalCallDuration.Record(ctx, duration.Seconds(), attrs)
 

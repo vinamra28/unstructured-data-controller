@@ -23,7 +23,6 @@ import (
 
 	udctelemetry "github.com/redhat-data-and-ai/unstructured-data-controller/pkg/telemetry"
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -37,7 +36,7 @@ func GetProcessedDocument(
 ) (_ *ProcessedDocumentResult, err error) {
 	ctx, span := otel.Tracer("pkg/snowflake").Start(ctx, "snowflake.get_processed_document",
 		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(attribute.String("db.system", "snowflake"), attribute.String("db.name", database)))
+		trace.WithAttributes(dbSpanAttributes(database)...))
 	defer func() {
 		udctelemetry.RecordSpanError(span, err)
 		span.End()

@@ -107,6 +107,10 @@ func main() {
 		// exporting every trace would flood the collector. Operators can raise
 		// this at runtime with OTEL_TRACES_SAMPLER_ARG when debugging.
 		TraceSampleRatio: 0.1,
+		// Send SDK diagnostics through the same logger as everything else, so
+		// a failing exporter is visible in the pod logs instead of only on
+		// stderr in a format the log pipeline cannot parse.
+		Logger: ctrl.Log.WithName("otel"),
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to initialize metrics provider")

@@ -107,6 +107,67 @@ func TestSanitizeRedactsSecrets(t *testing.T) {
 	}
 }
 
+// TestSanitizeProducesExactOutput pins the full replacement text. The
+// Contains/NotContains assertions above pass even when the non-secret part of
+// a match is mangled, which is how a URL-only rewrite ("key[REDACTED]@") went
+// unnoticed while it was being applied to bearer and key=value matches too.
+func TestSanitizeProducesExactOutput(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "url keeps its scheme and host",
+			input:    "dial failed: postgres://admin:hunter2@db.internal:5432/mydb",
+			expected: "dial failed: postgres://[REDACTED]@db.internal:5432/mydb",
+		},
+		{
+			name:     "bearer keeps the scheme word",
+			input:    "401 from API, sent Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.abc",
+			expected: "401 from API, sent Authorization: Bearer [REDACTED]",
+		},
+		{
+			name:     "basic keeps the scheme word",
+			input:    "auth rejected: Basic dXNlcjpwYXNzd29yZA==",
+			expected: "auth rejected: Basic [REDACTED]",
+		},
+		{
+			name:     "key=value keeps the key and separator",
+			input:    "connect error: user=svc password=s3cr3t host=snowflake",
+			expected: "connect error: user=svc password=[REDACTED] host=snowflake",
+		},
+		{
+			// The JSON must stay structurally readable; an earlier version
+			// emitted a fabricated '@' and ate the closing quote and brace.
+			name:     "json body keeps its structure",
+			input:    `embedding call failed: {"api_key": "sk-live-abc123", "model": "nomic"}`,
+			expected: `embedding call failed: {"api_key": [REDACTED], "model": "nomic"}`,
+		},
+		{
+			name:     "query parameter keeps the key and following params",
+			input:    "GET /v1/embed?token=abcd1234&model=nomic returned 500",
+			expected: "GET /v1/embed?token=[REDACTED]&model=nomic returned 500",
+		},
+		{
+			name:     "single quoted value",
+			input:    "dsn rejected: password='s3cr3t' sslmode=require",
+			expected: "dsn rejected: password=[REDACTED] sslmode=require",
+		},
+		{
+			name:     "multiple secrets in one message",
+			input:    "token=aaa and password=bbb",
+			expected: "token=[REDACTED] and password=[REDACTED]",
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			assert.Equal(t, testCase.expected, sanitize(testCase.input))
+		})
+	}
+}
+
 func TestSanitizeLeavesBenignMessagesIntact(t *testing.T) {
 	msg := "snowflake query failed: table CHUNKS does not exist in schema PUBLIC"
 	assert.Equal(t, msg, sanitize(msg))

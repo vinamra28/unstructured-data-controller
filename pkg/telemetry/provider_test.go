@@ -44,6 +44,156 @@ func preserveGlobals(t *testing.T) {
 	})
 }
 
+// targetInfoLabels returns the labels of the Prometheus target_info series,
+// which the OTel exporter builds from the resource. It is the only place the
+// resource surfaces without reaching into unexported Provider state.
+func targetInfoLabels(t *testing.T, registry *prometheus.Registry) map[string]string {
+	t.Helper()
+
+	families, err := registry.Gather()
+	require.NoError(t, err)
+
+	for _, family := range families {
+		if family.GetName() != "target_info" {
+			continue
+		}
+		require.NotEmpty(t, family.GetMetric())
+		labels := map[string]string{}
+		for _, label := range family.GetMetric()[0].GetLabel() {
+			labels[label.GetName()] = label.GetValue()
+		}
+		return labels
+	}
+	t.Fatal("target_info series not found; the exporter should publish the resource")
+	return nil
+}
+
+func TestInitResourceIdentifiesTheSDKAndInstance(t *testing.T) {
+	preserveGlobals(t)
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+	t.Setenv("OTEL_SDK_DISABLED", "")
+	registry := prometheus.NewRegistry()
+
+	provider, err := Init(context.Background(), Config{
+		ServiceName:          "test-service",
+		ServiceVersion:       "0.0.1",
+		PrometheusRegisterer: registry,
+	})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, provider.Shutdown(context.Background())) }()
+
+	labels := targetInfoLabels(t, registry)
+
+	// Without service.instance.id every replica emits an identical resource
+	// and a backend cannot tell which pod produced a series.
+	assert.NotEmpty(t, labels["service_instance_id"],
+		"resource should carry service.instance.id")
+	assert.Equal(t, "opentelemetry", labels["telemetry_sdk_name"],
+		"resource should carry telemetry.sdk.* from WithTelemetrySDK")
+	assert.Equal(t, "go", labels["telemetry_sdk_language"])
+	assert.Equal(t, "test-service", labels["service_name"])
+}
+
+func TestInstanceIDIsStableWithinAProcess(t *testing.T) {
+	// The pod name is what an operator correlates against, so it must not
+	// change between calls within one process.
+	assert.Equal(t, instanceID(), instanceID())
+	assert.NotEmpty(t, instanceID())
+}
+
+func TestInitHonorsSDKDisabled(t *testing.T) {
+	preserveGlobals(t)
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+	t.Setenv("OTEL_SDK_DISABLED", "true")
+	registry := prometheus.NewRegistry()
+
+	provider, err := Init(context.Background(), Config{
+		ServiceName:          "test-service",
+		ServiceVersion:       "0.0.1",
+		PrometheusRegisterer: registry,
+	})
+	require.NoError(t, err)
+
+	assert.Nil(t, provider.meterProvider, "no MeterProvider should be built when the SDK is disabled")
+	assert.Nil(t, provider.tracerProvider, "no TracerProvider should be built when the SDK is disabled")
+
+	families, err := registry.Gather()
+	require.NoError(t, err)
+	assert.Empty(t, families, "a disabled SDK must not publish anything to the registry")
+
+	// Recording sites must stay valid: the kill switch is for load, not for
+	// making every caller nil-check.
+	assert.NotPanics(t, func() {
+		provider.RecordFilesProcessed(context.Background(), "AnyController", 1)
+		provider.RecordExternalCall(context.Background(), "snowflake", "query", time.Second, nil)
+		var retErr error
+		provider.ReconcileObserver("AnyController").End(context.Background(), &retErr)
+		_, endTool := provider.ToolObserver(context.Background(), "any_tool")
+		endTool("")
+		require.NoError(t, provider.Shutdown(context.Background()))
+	})
+}
+
+func TestInitIgnoresMalformedSDKDisabled(t *testing.T) {
+	preserveGlobals(t)
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+	// A value that is not a bool must not silently disable telemetry; the
+	// safe reading of a typo is "the operator did not mean to turn this off".
+	t.Setenv("OTEL_SDK_DISABLED", "yes-please")
+
+	provider, err := Init(context.Background(), Config{
+		ServiceName:    "test-service",
+		ServiceVersion: "0.0.1",
+	})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, provider.Shutdown(context.Background())) }()
+
+	assert.NotNil(t, provider.meterProvider, "malformed OTEL_SDK_DISABLED should leave the SDK enabled")
+}
+
+func TestInitDefersToOTELTracesSampler(t *testing.T) {
+	preserveGlobals(t)
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+	t.Setenv("OTEL_SDK_DISABLED", "")
+	// always_off is what an operator reaches for to protect an overloaded
+	// collector. WithSampler would override it outright, so Init must not
+	// apply its own sampler when this is set.
+	t.Setenv("OTEL_TRACES_SAMPLER", "always_off")
+
+	provider, err := Init(context.Background(), Config{
+		ServiceName:    "test-service",
+		ServiceVersion: "0.0.1",
+		// Would otherwise force 100% sampling and mask the env var.
+		TraceSampleRatio: 1.0,
+	})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, provider.Shutdown(context.Background())) }()
+
+	_, span := provider.tracerProvider.Tracer("test").Start(context.Background(), "op")
+	defer span.End()
+	assert.False(t, span.IsRecording(), "OTEL_TRACES_SAMPLER=always_off should win over TraceSampleRatio")
+}
+
+func TestInitAppliesConfiguredSamplerWithoutTheEnvVar(t *testing.T) {
+	preserveGlobals(t)
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+	t.Setenv("OTEL_SDK_DISABLED", "")
+	t.Setenv("OTEL_TRACES_SAMPLER", "")
+	t.Setenv("OTEL_TRACES_SAMPLER_ARG", "")
+
+	provider, err := Init(context.Background(), Config{
+		ServiceName:      "test-service",
+		ServiceVersion:   "0.0.1",
+		TraceSampleRatio: 1.0,
+	})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, provider.Shutdown(context.Background())) }()
+
+	_, span := provider.tracerProvider.Tracer("test").Start(context.Background(), "op")
+	defer span.End()
+	assert.True(t, span.IsRecording(), "the configured ratio should apply when no sampler env var is set")
+}
+
 func TestInitWithDefaults(t *testing.T) {
 	preserveGlobals(t)
 	// Without OTEL_EXPORTER_OTLP_ENDPOINT, only Prometheus export should be active.

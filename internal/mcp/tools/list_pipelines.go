@@ -75,17 +75,13 @@ If EXACTLY ONE pipeline matches the user's question, use it.
 If MORE THAN ONE pipeline could match, STOP and ask the user which one to use. Do NOT pick one yourself.
 If NONE match, tell the user. Do NOT try all pipelines.
 If the pipeline has a "guidance" field, follow those instructions when working with this pipeline's data.`,
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (res *mcp.CallToolResult, _ any, _ error) {
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
 		username := ""
 		if tokenInfo, ok := auth.TokenInfoFromContext(ctx); ok {
 			username = tokenInfo.Username
 		}
 		ctx = logger.NewContext(ctx, uuid.NewString(), "list_unstructured_data_pipelines_for_user", username)
 		log := logger.FromContext(ctx)
-
-		var endTool func(cause string)
-		ctx, endTool = metricsProvider.ToolObserver(ctx, "list_pipelines")
-		defer func() { endTool(toolFailureCause(res)) }()
 
 		log.Info("tool invoked")
 

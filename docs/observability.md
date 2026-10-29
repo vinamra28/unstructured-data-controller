@@ -27,6 +27,12 @@ All configuration uses standard [OTel environment variables](https://opentelemet
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTel Collector endpoint (e.g. `http://otel-collector:4317`). Enables OTLP push when set. | unset (disabled) |
 | `OTEL_EXPORTER_OTLP_INSECURE` | Disable TLS for the collector connection (plaintext gRPC). An `http://` endpoint scheme also disables TLS. | `false` |
 | `OTEL_SERVICE_NAME` | Override the default service name in telemetry data. | set by the binary |
+| `OTEL_RESOURCE_ATTRIBUTES` | Additional resource attributes, as `key=value` pairs. | unset |
+| `OTEL_SDK_DISABLED` | Set to `true` to turn telemetry off without a redeploy. No Prometheus collector is registered and no OTLP connection is opened. | `false` |
+| `OTEL_TRACES_SAMPLER` | Sampler name (e.g. `always_off`, `traceidratio`). When set, it replaces the binary's built-in sampler entirely. | unset (binary's own ratio applies) |
+| `OTEL_TRACES_SAMPLER_ARG` | Sampling ratio between 0 and 1. | binary's own ratio |
+
+Not yet supported: the per-signal endpoint variables (`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`) and `OTEL_EXPORTER_OTLP_PROTOCOL`. OTLP is gated on `OTEL_EXPORTER_OTLP_ENDPOINT` alone and always uses gRPC.
 
 ### Enabling OTLP push
 
@@ -58,6 +64,10 @@ annotations:
   prometheus.io/port: "8000"
   prometheus.io/path: "/metrics"
 ```
+
+### SDK diagnostics
+
+Both binaries pass a `Logger` in `telemetry.Config`, so OTel's own failures -- a refused OTLP connection, an expired collector certificate, dropped spans -- are reported through the same structured log pipeline as everything else, under the `otel` logger name. Without this the SDK writes them to a bare `log.Print` on stderr, and a broken exporter looks like flat dashboards with healthy, Ready pods and nothing in the logs.
 
 ## Metrics Reference
 
@@ -91,32 +101,39 @@ Recorded per tool invocation.
 | `udc.mcp.tool.errors` | Counter | error | Tool invocations that returned an error |
 | `udc.mcp.external.duration` | Histogram | seconds | Duration of external service calls (K8s, Snowflake, embedding API) |
 
-Tool metrics include a `tool` attribute. External call metrics include `service` and `operation` attributes.
+Tool metrics include a `tool` attribute. External call metrics include `service`, `operation`, and `outcome` (`success` or `error`) attributes.
+
+`udc.mcp.external.duration` is the only external-call instrument, so `outcome` is what makes a dependency failure visible in metrics. Alert on the error share rather than on latency alone, since a dependency that fails fast lowers p99:
+
+```
+sum by (service) (rate(udc_mcp_external_duration_seconds_count{outcome="error"}[5m]))
+  / sum by (service) (rate(udc_mcp_external_duration_seconds_count[5m]))
+```
 
 ### MCP Server traces
 
-When OTLP is enabled, the MCP server emits traces with spans for each tool invocation and child spans for external service calls. Child spans are created in `pkg/` packages via the global `otel.Tracer()` API and propagate automatically through context.
+When OTLP is enabled, the MCP server emits traces with spans for each tool invocation and child spans for external service calls. The tool span is started by `TelemetryMiddleware` (see below), so its name is always the name the tool was registered under. Child spans are created in `pkg/` packages via the global `otel.Tracer()` API and propagate automatically through context.
 
 **get_chunks_for_embeddings:**
 ```
 mcp.tool/get_chunks_for_embeddings       [root, attrs: mcp.pipeline_name]
   |-- k8s.get_pipeline_query_config      [attrs: pipeline.name, stage.type]
   |-- embedding.generate                 [attrs: embedding.model, embedding.input_count]
-  |-- snowflake.search_chunks            [attrs: db.system, db.name]
+  |-- snowflake.search_chunks            [attrs: db.system.name, db.namespace]
 ```
 
-**list_pipelines:**
+**list_unstructured_data_pipelines_for_user:**
 ```
-mcp.tool/list_pipelines                  [root]
+mcp.tool/list_unstructured_data_pipelines_for_user   [root]
   |-- k8s.list_pipelines
-  |-- snowflake.show_databases           [attrs: db.system]
+  |-- snowflake.show_databases           [attrs: db.system.name]
 ```
 
 **get_processed_document:**
 ```
 mcp.tool/get_processed_document          [root, attrs: mcp.pipeline_name, mcp.file_id]
   |-- k8s.get_pipeline_query_config      [attrs: pipeline.name, stage.type]
-  |-- snowflake.get_processed_document   [attrs: db.system, db.name]
+  |-- snowflake.get_processed_document   [attrs: db.system.name, db.namespace]
 ```
 
 Traces are useful for Langfuse integration (LLM observability) and debugging latency in the tool call chain.
@@ -125,10 +142,9 @@ Traces are useful for Langfuse integration (LLM observability) and debugging lat
 
 ### New controller
 
-Add named returns and a `ReconcileObserver` defer at the top of the `Reconcile` method:
-
-Add a `Metrics *udctelemetry.Provider` field to the reconciler struct, then use
-named returns with a `ReconcileObserver` defer at the top of `Reconcile`:
+Add a `Metrics *udctelemetry.Provider` field to the reconciler struct and wrap
+the reconciler with `ObserveReconciler` in `SetupWithManager`. `Reconcile`
+itself needs no telemetry code:
 
 ```go
 type MyReconciler struct {
@@ -138,11 +154,18 @@ type MyReconciler struct {
     Metrics *udctelemetry.Provider
 }
 
-func (r *MyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, retErr error) {
-    defer r.Metrics.ReconcileObserver(MyControllerName).End(ctx, &retErr)
-    // ... existing reconcile logic ...
+func (r *MyReconciler) SetupWithManager(mgr ctrl.Manager) error {
+    return ctrl.NewControllerManagedBy(mgr).
+        For(&operatorv1alpha1.MyResource{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+        Named("myresource").
+        Complete(r.Metrics.ObserveReconciler(MyControllerName, r))
 }
 ```
+
+Decorating the reconciler rather than deferring inside `Reconcile` also counts
+panics. controller-runtime's `recover()` sits *above* the reconciler, so a
+panicking reconcile unwinds past an in-method defer while the named error
+return is still nil, and would be recorded as a success.
 
 To track files processed, call `RecordFilesProcessed` *after* the status patch
 succeeds, so a failed patch followed by a retry does not double-count:
@@ -156,25 +179,34 @@ if err := controllerutils.StatusPatch(ctx, r.Client, cr, func() {
 r.Metrics.RecordFilesProcessed(ctx, MyControllerName, count)
 ```
 
-Wire the provider in `cmd/main.go` when constructing the reconciler. Every
-`Provider` method is nil-safe, so no nil guards are needed at recording sites
-and reconcilers work unchanged when telemetry is disabled in tests.
+Wire the provider in `cmd/main.go` when constructing the reconciler. The
+recording methods tolerate a nil `Provider`, so no nil guards are needed at
+recording sites and reconcilers work unchanged when telemetry is disabled in
+tests.
 
 ### New MCP tool
 
-Add a `*udctelemetry.Provider` parameter to the Register function and use
-`ToolObserver` + `RecordExternalCall`:
+Call count, duration, errors, and the tool span are recorded by
+`tools.TelemetryMiddleware`, registered once on the server in
+`cmd/unstructured-data-mcp-server/main.go`:
+
+```go
+mcpServer.AddReceivingMiddleware(mcptools.TelemetryMiddleware(metricsProvider))
+```
+
+A new tool is therefore instrumented as soon as it is registered, under the
+name it was registered with, and nothing needs adding to the handler. The
+middleware sees arguments only as raw JSON, so a handler that wants them on
+the span adds them itself. Take a `*udctelemetry.Provider` parameter only if
+the tool makes external calls worth timing:
 
 ```go
 func RegisterMyTool(s *mcp.Server, metricsProvider *udctelemetry.Provider) {
     mcp.AddTool(s, &mcp.Tool{...},
-        func(ctx context.Context, ...) (res *mcp.CallToolResult, _ any, _ error) {
-        // toolFailureCause pulls the reason out of the result so the span
-        // records why the call failed, not just that it did.
-        var endTool func(cause string)
-        ctx, endTool = metricsProvider.ToolObserver(ctx, "my_tool",
+        func(ctx context.Context, _ *mcp.CallToolRequest, args myToolArgs) (*mcp.CallToolResult, any, error) {
+        // Enrich the span the middleware already started.
+        trace.SpanFromContext(ctx).SetAttributes(
             attribute.String("mcp.pipeline_name", args.PipelineName))
-        defer func() { endTool(toolFailureCause(res)) }()
 
         // Time external calls:
         start := time.Now()
@@ -187,6 +219,10 @@ func RegisterMyTool(s *mcp.Server, metricsProvider *udctelemetry.Provider) {
     })
 }
 ```
+
+A handler reports failure through `CallToolResult.IsError` rather than a Go
+error, so the middleware inspects both the result and the returned error to
+decide whether a call failed. It also counts a panicking handler as a failure.
 
 ### Recording errors on spans
 
@@ -206,12 +242,21 @@ containing `@`, bearer/basic tokens, and `password=`/`token=`/`api_key` pairs)
 and truncates oversized messages before marking the span failed. A nil error is
 a no-op, so the call can be deferred unconditionally.
 
-The same sanitization runs inside `ToolObserver` and `RecordExternalCall`, so
-every span this project creates is covered.
+The same sanitization runs inside `TelemetryMiddleware` and
+`RecordExternalCall`, so every span this project writes an error to goes
+through it.
+
+Sanitization covers the span path only. The same error is usually also logged
+and, in MCP handlers, returned to the client in the tool result -- neither is
+redacted, so do not rely on this as the only control when handling an error
+that may carry credential material.
 
 ### New pkg/ function with external calls
 
-Add a trace span using the global `otel.Tracer()` API. No import of `internal/` or `pkg/telemetry` needed -- the span propagates automatically when the caller has an active span:
+Add a trace span using the global `otel.Tracer()` API -- the span propagates
+automatically when the caller has an active span, so there is no need to
+thread a provider through. Record the error with `RecordSpanError`, which
+means the package does take a `pkg/telemetry` import:
 
 ```go
 func MyExternalCall(ctx context.Context, ...) (result T, err error) {
@@ -219,10 +264,7 @@ func MyExternalCall(ctx context.Context, ...) (result T, err error) {
         trace.WithSpanKind(trace.SpanKindClient),
         trace.WithAttributes(attribute.String("key", "value")))
     defer func() {
-        if err != nil {
-            span.RecordError(err)
-            span.SetStatus(codes.Error, err.Error())
-        }
+        udctelemetry.RecordSpanError(span, err)
         span.End()
     }()
     // ... existing logic ...
@@ -269,7 +311,7 @@ The collector logs will show received metric data points.
 ### Unit tests
 
 ```bash
-go test -v ./pkg/telemetry/
+make test
 ```
 
 ## Architecture Decisions
@@ -278,4 +320,4 @@ go test -v ./pkg/telemetry/
 
 **Why not the Prometheus-to-OTel bridge?** The bridge adds app-side overhead and silently drops Summary metrics. Since this is a new instrumentation effort (no existing Prometheus metrics to migrate), writing directly against the OTel SDK avoids the translation layer entirely. Controller-runtime's built-in Prometheus metrics remain on the `/metrics` endpoint as-is.
 
-**Why pin OTel exporters to v1.44.0?** The existing controller-runtime dependency pulls in `otel v1.44.0`. Pinning the exporters to matching versions avoids cascading transitive dependency upgrades (newer OTel versions require Go 1.26, while the project targets Go 1.25).
+**Why keep every OTel module on one version?** The SDK, the API, and the exporters share internal packages, so mixing versions across `go.opentelemetry.io/otel*` produces build failures and silently inconsistent behaviour. All of them are held at `v1.47.0`, except the Prometheus exporter, which tracks the same releases on its own pre-1.0 line (`v0.69.0`), and `contrib/instrumentation/net/http/otelhttp` (`v0.70.0`). Moving to v1.47.0 pulled a set of transitive upgrades with it (gRPC, protobuf, `golang.org/x/net`, `golang.org/x/crypto`, `go-openapi`, and `cenkalti/backoff` v4 to v5); the alternative, holding OTel back to the version controller-runtime pins, would have meant running exporters older than the API they are compiled against.

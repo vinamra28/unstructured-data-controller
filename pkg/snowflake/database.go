@@ -21,7 +21,6 @@ import (
 
 	udctelemetry "github.com/redhat-data-and-ai/unstructured-data-controller/pkg/telemetry"
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -33,7 +32,7 @@ type DatabaseInfo struct {
 func ShowDatabases(ctx context.Context, oauthToken string) (result []DatabaseInfo, err error) {
 	ctx, span := otel.Tracer("pkg/snowflake").Start(ctx, "snowflake.show_databases",
 		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(attribute.String("db.system", "snowflake")))
+		trace.WithAttributes(dbSpanAttributes("")...))
 	defer func() {
 		udctelemetry.RecordSpanError(span, err)
 		span.End()

@@ -46,7 +46,8 @@ const (
 
 func main() {
 	logger.Init()
-	ctrl.SetLogger(logr.FromSlogHandler(slog.Default().Handler()))
+	slogLogger := logr.FromSlogHandler(slog.Default().Handler())
+	ctrl.SetLogger(slogLogger)
 
 	// Initialize OTel metrics and tracing. Prometheus metrics are served on /metrics.
 	// OTLP push (for Datadog/Langfuse) activates when OTEL_EXPORTER_OTLP_ENDPOINT is set.
@@ -58,6 +59,10 @@ func main() {
 			// loops, and Langfuse usage analytics need every invocation to get
 			// accurate counts. Export all traces.
 			TraceSampleRatio: 1.0,
+			// Send SDK diagnostics through the same slog pipeline as the rest
+			// of the server, so a failing exporter appears in the JSON logs
+			// rather than only on stderr.
+			Logger: slogLogger.WithName("otel"),
 		},
 	)
 	if err != nil {
@@ -91,6 +96,10 @@ func main() {
 		},
 		nil,
 	)
+
+	// Record call metrics and a trace span for every tool, including any added
+	// later, rather than threading an observer through each handler.
+	mcpServer.AddReceivingMiddleware(mcptools.TelemetryMiddleware(metricsProvider))
 
 	embeddingClient := embedding.NewHTTPClient(&embedding.HTTPClientConfig{
 		Endpoint:   os.Getenv("EMBEDDING_ENDPOINT"),

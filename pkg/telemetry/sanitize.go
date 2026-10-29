@@ -32,40 +32,58 @@ const maxMessageLen = 256
 
 const redacted = "[REDACTED]"
 
-// secretPatterns match credential material that downstream clients commonly
+// secretRules match credential material that downstream clients commonly
 // embed in error strings. Errors recorded on spans leave the process and land
 // in Datadog and Langfuse, so these are stripped before export.
-var secretPatterns = []*regexp.Regexp{
-	// Credentials in a URL userinfo section: scheme://user:password@host
-	//
-	// Both userinfo parts use [^/\s]* rather than excluding '@'. A password
-	// may itself contain '@', and stopping at the first one would leave the
-	// remainder of the password in the message. Greedy matching consumes
-	// through the last '@' of the userinfo; '/' and whitespace still bound
-	// the match so a later unrelated '@' (an email address, say) is safe.
-	regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://)[^/\s]*:[^/\s]*@`),
-	// Authorization header values: "Bearer abc123", "Basic dXNlcjpwYXNz"
-	regexp.MustCompile(`(?i)\b(bearer|basic)\s+[A-Za-z0-9\-._~+/=]+`),
-	// key=value and key: value pairs for sensitive key names. The optional
-	// quote after the key name covers JSON bodies ("api_key": "...") as well
-	// as bare connection-string and query-parameter forms (password=...).
-	regexp.MustCompile(
-		`(?i)\b(password|passwd|token|secret|api[_-]?key|access[_-]?key|private[_-]?key|credential)` +
-			`"?\s*[=:]\s*("[^"]*"|'[^']*'|[^\s,;&)}]+)`),
+//
+// Each rule carries its own replacement template. A single shared template
+// cannot work: what is safe to keep differs per pattern (the URL scheme, the
+// auth scheme word, the key name), and keeping it is what leaves the message
+// diagnosable. The templates are compile-time constants, so the $-expansion
+// ReplaceAllString performs can never be driven by the error text itself.
+var secretRules = []struct {
+	pattern     *regexp.Regexp
+	replacement string
+}{
+	{
+		// Credentials in a URL userinfo section: scheme://user:password@host
+		//
+		// Both userinfo parts use [^/\s]* rather than excluding '@'. A password
+		// may itself contain '@', and stopping at the first one would leave the
+		// remainder of the password in the message. Greedy matching consumes
+		// through the last '@' of the userinfo; '/' and whitespace still bound
+		// the match so a later unrelated '@' (an email address, say) is safe.
+		//
+		// The scheme is kept so the host context survives.
+		pattern:     regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://)[^/\s]*:[^/\s]*@`),
+		replacement: "${1}" + redacted + "@",
+	},
+	{
+		// Authorization header values: "Bearer abc123", "Basic dXNlcjpwYXNz".
+		// The scheme word is kept: it says which auth scheme was rejected and
+		// is not itself secret.
+		pattern:     regexp.MustCompile(`(?i)\b(bearer|basic)\s+[A-Za-z0-9\-._~+/=]+`),
+		replacement: "${1} " + redacted,
+	},
+	{
+		// key=value and key: value pairs for sensitive key names. The optional
+		// quote after the key name covers JSON bodies ("api_key": "...") as well
+		// as bare connection-string and query-parameter forms (password=...).
+		//
+		// The key name and separator are kept so a reader can tell which
+		// credential the message was carrying; only the value is replaced.
+		pattern: regexp.MustCompile(
+			`(?i)\b(password|passwd|token|secret|api[_-]?key|access[_-]?key|private[_-]?key|credential)` +
+				`("?\s*[=:]\s*)("[^"]*"|'[^']*'|[^\s,;&)}]+)`),
+		replacement: "${1}${2}" + redacted,
+	},
 }
 
 // sanitize strips credential material from a message and truncates it so error
 // text recorded on spans cannot leak secrets to telemetry backends.
 func sanitize(msg string) string {
-	for _, pattern := range secretPatterns {
-		msg = pattern.ReplaceAllStringFunc(msg, func(match string) string {
-			// Preserve the leading scheme for URL matches so the host context
-			// survives; everything after it is credential material.
-			if loc := pattern.FindStringSubmatchIndex(match); len(loc) >= 4 && loc[2] == 0 {
-				return match[loc[2]:loc[3]] + redacted + "@"
-			}
-			return redacted
-		})
+	for _, rule := range secretRules {
+		msg = rule.pattern.ReplaceAllString(msg, rule.replacement)
 	}
 
 	if len(msg) > maxMessageLen {

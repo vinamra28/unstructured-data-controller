@@ -26,6 +26,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/go-logr/logr"
+	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	promexporter "go.opentelemetry.io/otel/exporters/prometheus"
@@ -33,6 +35,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	metricnoop "go.opentelemetry.io/otel/metric/noop"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -62,7 +65,20 @@ type Config struct {
 	// the controller should lower this so continuous reconcile loops do not
 	// overwhelm the collector. OTEL_TRACES_SAMPLER_ARG overrides this at runtime.
 	TraceSampleRatio float64
+
+	// Logger receives OTel SDK diagnostics: export failures, dropped spans and
+	// internal errors. Without it the SDK writes them to a bare log.Print on
+	// stderr, which neither binary's structured log pipeline can parse, so an
+	// expired collector certificate shows up as flat dashboards with healthy
+	// pods and nothing logged. The zero value leaves the SDK default in place.
+	Logger logr.Logger
 }
+
+// errorHandlerFunc adapts a function to otel.ErrorHandler, which this version
+// of the API does not provide an adapter for.
+type errorHandlerFunc func(error)
+
+func (f errorHandlerFunc) Handle(err error) { f(err) }
 
 // Provider manages OTel MeterProvider and TracerProvider lifecycle.
 // It supports dual export: Prometheus (always on) and OTLP gRPC (when OTEL_EXPORTER_OTLP_ENDPOINT is set).
@@ -83,10 +99,41 @@ type Provider struct {
 // Prometheus export is always active. OTLP push activates when OTEL_EXPORTER_OTLP_ENDPOINT
 // is set - the SDK reads that env var automatically, so no manual endpoint parsing is needed.
 func Init(ctx context.Context, cfg Config) (_ *Provider, retErr error) {
+	// Route SDK diagnostics into the caller's logger before anything can fail,
+	// so errors raised during setup are reported the same way as runtime ones.
+	// Skipped for a zero-value Logger: the SDK's stderr default is noisy but
+	// still better than installing a handler that silently drops errors.
+	if cfg.Logger.GetSink() != nil {
+		otel.SetLogger(cfg.Logger)
+		otel.SetErrorHandler(errorHandlerFunc(func(err error) {
+			cfg.Logger.Error(err, "OpenTelemetry SDK error")
+		}))
+	}
+
+	// OTEL_SDK_DISABLED is the spec's kill switch, the one an operator reaches
+	// for to shed telemetry load without a redeploy. The Go SDK does not act on
+	// it, so it has to be handled here. Instruments are still built, against a
+	// no-op meter, so every recording site stays valid and no Prometheus
+	// collector or OTLP connection is created.
+	if disabled, parseErr := strconv.ParseBool(os.Getenv("OTEL_SDK_DISABLED")); parseErr == nil && disabled {
+		inst, instErr := newInstruments(metricnoop.NewMeterProvider())
+		if instErr != nil {
+			return nil, instErr
+		}
+		return &Provider{instruments: inst}, nil
+	}
+
 	res, err := resource.New(ctx,
+		// WithTelemetrySDK adds telemetry.sdk.{name,language,version}, which
+		// backends use to attribute data to the emitting SDK.
+		resource.WithTelemetrySDK(),
 		resource.WithAttributes(
 			semconv.ServiceName(cfg.ServiceName),
 			semconv.ServiceVersion(cfg.ServiceVersion),
+			// Without service.instance.id every replica of a Deployment emits
+			// a byte-identical resource, so a backend cannot tell their series
+			// apart or point at the pod that produced a spike.
+			semconv.ServiceInstanceID(instanceID()),
 		),
 		// WithFromEnv reads OTEL_SERVICE_NAME and OTEL_RESOURCE_ATTRIBUTES.
 		// Later detectors override earlier ones, so env vars take precedence
@@ -142,6 +189,18 @@ func Init(ctx context.Context, cfg Config) (_ *Provider, retErr error) {
 
 	meterProviderReady = true
 	return p, nil
+}
+
+// instanceID identifies this process among replicas of the same service.
+// In Kubernetes the hostname is the pod name, which is stable for the pod's
+// lifetime and is what an operator correlates a metric spike against. The
+// random fallback only applies where no hostname is available, and still
+// beats every replica sharing one identity.
+func instanceID() string {
+	if hostname, err := os.Hostname(); err == nil && hostname != "" {
+		return hostname
+	}
+	return uuid.NewString()
 }
 
 // shutdownBounded runs a provider shutdown under cleanupTimeout so a hung
@@ -202,7 +261,14 @@ func setupTracerProvider(
 ) (*sdktrace.TracerProvider, error) {
 	tpOpts := []sdktrace.TracerProviderOption{
 		sdktrace.WithResource(res),
-		sdktrace.WithSampler(traceSampler(cfg.TraceSampleRatio)),
+	}
+
+	// WithSampler overrides OTEL_TRACES_SAMPLER outright, so it is only applied
+	// when the operator has not named a sampler. Leaving it off lets the SDK
+	// read the variable itself, which is what someone setting always_off to
+	// protect an overloaded collector mid-incident expects to happen.
+	if os.Getenv("OTEL_TRACES_SAMPLER") == "" {
+		tpOpts = append(tpOpts, sdktrace.WithSampler(traceSampler(cfg.TraceSampleRatio)))
 	}
 
 	if os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT") != "" {

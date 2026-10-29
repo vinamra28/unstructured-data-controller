@@ -60,8 +60,7 @@ type DestinationSyncerReconciler struct {
 // +kubebuilder:rbac:groups=operator.dataverse.redhat.com,namespace=unstructured-controller-namespace,resources=unstructureddatapipelines,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups="",namespace=unstructured-controller-namespace,resources=secrets,verbs=get;list;watch
 
-func (r *DestinationSyncerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, retErr error) {
-	defer r.Metrics.ReconcileObserver(DestinationSyncerControllerName).End(ctx, &retErr)
+func (r *DestinationSyncerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	logger.Info("reconciling", "controller", DestinationSyncerControllerName)
 
@@ -217,5 +216,5 @@ func (r *DestinationSyncerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&operatorv1alpha1.VectorEmbeddingsGenerator{}, handler.EnqueueRequestsFromMapFunc(r.findDependents), builder.WithPredicates(controllerutils.FilesProcessedChangedPredicate{})).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.findSecretDependents)).
 		Named("destinationsync").
-		Complete(r)
+		Complete(r.Metrics.ObserveReconciler(DestinationSyncerControllerName, r))
 }

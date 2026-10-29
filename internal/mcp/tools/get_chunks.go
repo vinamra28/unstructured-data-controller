@@ -28,6 +28,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	operatorv1alpha1 "github.com/redhat-data-and-ai/unstructured-data-controller/api/v1alpha1"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/auth"
@@ -58,7 +59,7 @@ If pipeline_name is not known, call list_unstructured_data_pipelines_for_user fi
 If the returned chunks are not sufficient to answer the user's question, you may call get_processed_document with the same pipeline_name and the file_id from the top matching chunk to retrieve the full processed document for more context.
 On error: report the exact error to the user and STOP. Do NOT retry with other pipelines.
 On follow-up: if the user is not satisfied, ask them which pipeline to search. Do NOT automatically try other pipelines.`,
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, args getChunksArgs) (res *mcp.CallToolResult, _ any, _ error) {
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, args getChunksArgs) (*mcp.CallToolResult, any, error) {
 		username := ""
 		if tokenInfo, ok := auth.TokenInfoFromContext(ctx); ok {
 			username = tokenInfo.Username
@@ -66,10 +67,10 @@ On follow-up: if the user is not satisfied, ask them which pipeline to search. D
 		ctx = logger.NewContext(ctx, uuid.NewString(), "get_chunks_for_embeddings", username)
 		log := logger.FromContext(ctx)
 
-		var endTool func(cause string)
-		ctx, endTool = metricsProvider.ToolObserver(ctx, "get_chunks_for_embeddings",
+		// TelemetryMiddleware already started the tool span; enrich it with
+		// the decoded arguments, which the middleware only sees as raw JSON.
+		trace.SpanFromContext(ctx).SetAttributes(
 			attribute.String("mcp.pipeline_name", args.PipelineName))
-		defer func() { endTool(toolFailureCause(res)) }()
 
 		log.Info("tool invoked", "pipeline_name", args.PipelineName)
 

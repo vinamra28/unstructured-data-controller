@@ -66,8 +66,7 @@ type DocumentProcessorReconciler struct {
 // +kubebuilder:rbac:groups=operator.dataverse.redhat.com,namespace=unstructured-controller-namespace,resources=documentprocessors/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=operator.dataverse.redhat.com,namespace=unstructured-controller-namespace,resources=documentprocessors/finalizers,verbs=update
 
-func (r *DocumentProcessorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, retErr error) {
-	defer r.Metrics.ReconcileObserver(DocumentProcessorControllerName).End(ctx, &retErr)
+func (r *DocumentProcessorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	logger.Info("reconciling", "controller", DocumentProcessorControllerName)
 
@@ -549,7 +548,7 @@ func (r *DocumentProcessorReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&operatorv1alpha1.VectorEmbeddingsGenerator{}, handler.EnqueueRequestsFromMapFunc(r.findDependents), builder.WithPredicates(controllerutils.FilesProcessedChangedPredicate{})).
 		Watches(&operatorv1alpha1.DestinationSyncer{}, handler.EnqueueRequestsFromMapFunc(r.findDependents), builder.WithPredicates(controllerutils.FilesProcessedChangedPredicate{})).
 		Named("documentprocessor").
-		Complete(r)
+		Complete(r.Metrics.ObserveReconciler(DocumentProcessorControllerName, r))
 }
 
 func (r *DocumentProcessorReconciler) handleError(ctx context.Context, documentProcessorCR *operatorv1alpha1.DocumentProcessor, err error) (ctrl.Result, error) {

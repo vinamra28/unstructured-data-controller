@@ -16,19 +16,74 @@ limitations under the License.
 
 package tools
 
-import "github.com/modelcontextprotocol/go-sdk/mcp"
+import (
+	"context"
 
-// toolFailureCause extracts the failure reason from a tool result so the
-// telemetry span carries why a call failed, not just that it did.
-// Returns an empty string for successful results, which the observer treats
-// as success. Tool handlers signal failure through CallToolResult.IsError
-// rather than a Go error, so the reason lives in the result's text content.
-func toolFailureCause(res *mcp.CallToolResult) string {
-	if res == nil || !res.IsError {
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	udctelemetry "github.com/redhat-data-and-ai/unstructured-data-controller/pkg/telemetry"
+)
+
+// methodCallTool is the JSON-RPC method name for a tool invocation. The MCP
+// SDK keeps its own copy of this constant unexported.
+const methodCallTool = "tools/call"
+
+// causeToolPanicked is recorded when a handler unwinds from a panic. The panic
+// value is deliberately not used: it can embed arbitrary downstream data, and
+// the span message is exported to Datadog and Langfuse.
+const causeToolPanicked = "tool call panicked"
+
+// TelemetryMiddleware returns MCP receiving middleware that records call
+// count, duration, and errors for every tool invocation, and wraps each call
+// in a trace span.
+//
+// Instrumenting here rather than inside each handler means the recorded tool
+// name is always the registered name, newly added tools are covered without
+// touching them, and a handler that panics is still counted.
+//
+// Safe to use with a nil Provider; the observer is then a no-op.
+func TelemetryMiddleware(metricsProvider *udctelemetry.Provider) mcp.Middleware {
+	return func(next mcp.MethodHandler) mcp.MethodHandler {
+		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+			// Only tool calls carry these metrics; initialize, tools/list,
+			// ping and the rest pass straight through.
+			callReq, isToolCall := req.(*mcp.CallToolRequest)
+			if method != methodCallTool || !isToolCall {
+				return next(ctx, method, req)
+			}
+
+			ctx, endTool := metricsProvider.ToolObserver(ctx, callReq.Params.Name)
+
+			// cause is resolved from the outcome on the way out. A panic skips
+			// that assignment, so it starts at the panic reason and is
+			// overwritten only once the handler has actually returned.
+			cause := causeToolPanicked
+			defer func() { endTool(cause) }()
+
+			res, err := next(ctx, method, req)
+			cause = toolCallCause(res, err)
+			return res, err
+		}
+	}
+}
+
+// toolCallCause extracts the failure reason from a tool call outcome so the
+// span carries why a call failed, not just that it did. Returns an empty
+// string for success, which the observer treats as no error.
+//
+// Both return values have to be inspected: a protocol-level failure surfaces
+// as a non-nil error, while a handler reports a user-facing failure through
+// CallToolResult.IsError with a nil error.
+func toolCallCause(res mcp.Result, err error) string {
+	if err != nil {
+		return err.Error()
+	}
+	callRes, ok := res.(*mcp.CallToolResult)
+	if !ok || callRes == nil || !callRes.IsError {
 		return ""
 	}
-	for _, content := range res.Content {
-		if text, ok := content.(*mcp.TextContent); ok && text.Text != "" {
+	for _, content := range callRes.Content {
+		if text, isText := content.(*mcp.TextContent); isText && text.Text != "" {
 			return text.Text
 		}
 	}

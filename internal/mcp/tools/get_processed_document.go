@@ -27,6 +27,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	operatorv1alpha1 "github.com/redhat-data-and-ai/unstructured-data-controller/api/v1alpha1"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/auth"
@@ -55,7 +56,7 @@ func RegisterGetProcessedDocument(
 		Description: `Retrieve processed document output from a pipeline's DocumentProcessor stage. Supports exact lookup via file_id or glob pattern matching via file_path_filter (e.g. "*/README.md"). At least one of file_id or file_path_filter is required.
 If pipeline_name is not known, call list_unstructured_data_pipelines_for_user first and follow the instructions in its response.
 On error: report the exact error to the user and STOP. Do NOT retry with other pipelines.`,
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, args getProcessedDocumentArgs) (res *mcp.CallToolResult, _ any, _ error) {
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, args getProcessedDocumentArgs) (*mcp.CallToolResult, any, error) {
 		username := ""
 		if tokenInfo, ok := auth.TokenInfoFromContext(ctx); ok {
 			username = tokenInfo.Username
@@ -63,12 +64,12 @@ On error: report the exact error to the user and STOP. Do NOT retry with other p
 		ctx = logger.NewContext(ctx, uuid.NewString(), "get_processed_document", username)
 		log := logger.FromContext(ctx)
 
-		var endTool func(cause string)
-		ctx, endTool = metricsProvider.ToolObserver(ctx, "get_processed_document",
+		// TelemetryMiddleware already started the tool span; enrich it with
+		// the decoded arguments, which the middleware only sees as raw JSON.
+		trace.SpanFromContext(ctx).SetAttributes(
 			attribute.String("mcp.pipeline_name", args.PipelineName),
 			attribute.String("mcp.file_id", args.FileID),
 			attribute.String("mcp.file_path_filter", args.FilePathFilter))
-		defer func() { endTool(toolFailureCause(res)) }()
 
 		log.Info("tool invoked", "pipeline_name", args.PipelineName, "file_id", args.FileID, "file_path_filter", args.FilePathFilter)
 

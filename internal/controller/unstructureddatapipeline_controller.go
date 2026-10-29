@@ -71,8 +71,7 @@ type UnstructuredDataPipelineReconciler struct {
 // +kubebuilder:rbac:groups=operator.dataverse.redhat.com,namespace=unstructured-controller-namespace,resources=destinationsyncers,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=operator.dataverse.redhat.com,namespace=unstructured-controller-namespace,resources=destinationsyncers/status,verbs=get
 
-func (r *UnstructuredDataPipelineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, retErr error) {
-	defer r.Metrics.ReconcileObserver(UnstructuredDataPipelineControllerName).End(ctx, &retErr)
+func (r *UnstructuredDataPipelineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	logger.Info("reconciling", "controller", UnstructuredDataPipelineControllerName)
 
@@ -367,7 +366,7 @@ func (r *UnstructuredDataPipelineReconciler) SetupWithManager(mgr ctrl.Manager) 
 		Owns(&operatorv1alpha1.ChunksGenerator{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&operatorv1alpha1.VectorEmbeddingsGenerator{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&operatorv1alpha1.DestinationSyncer{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
-		Complete(r)
+		Complete(r.Metrics.ObserveReconciler(UnstructuredDataPipelineControllerName, r))
 }
 
 func (r *UnstructuredDataPipelineReconciler) handleError(ctx context.Context, unstructuredDataPipelineCR *operatorv1alpha1.UnstructuredDataPipeline, err error) (ctrl.Result, error) {
