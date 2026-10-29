@@ -278,7 +278,10 @@ func (r *DocumentProcessorReconciler) reconcileJob(ctx context.Context, job oper
 			logger.Error(updateErr, "failed to delete job from status as it has completed successfully", "filePath", job.FilePath)
 			return updateErr
 		}
-		r.Metrics.RecordFilesProcessed(ctx, DocumentProcessorControllerName, 1)
+		// One file per completed job: this branch handles a single docling
+		// task, matching the Status.FilesProcessed++ in the patch above.
+		const filesPerCompletedJob = 1
+		r.Metrics.RecordFilesProcessed(ctx, DocumentProcessorControllerName, filesPerCompletedJob)
 		logger.Info("successfully removed job from status as it has completed successfully", "filePath", job.FilePath)
 
 	case docling.TaskStatusFailure, docling.TaskStatusSkipped:

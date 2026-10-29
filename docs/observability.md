@@ -36,7 +36,7 @@ All configuration uses standard [OTel environment variables](https://opentelemet
 | `OTEL_EXPORTER_OTLP_INSECURE` | Disable TLS for the collector connection (plaintext gRPC). An `http://` endpoint scheme also disables TLS. | `false` |
 | `OTEL_SERVICE_NAME` | Override the default service name in telemetry data. | set by the binary |
 | `OTEL_RESOURCE_ATTRIBUTES` | Additional resource attributes, as `key=value` pairs. | unset |
-| `OTEL_SDK_DISABLED` | Set to `true` to turn telemetry off without a redeploy. No Prometheus collector is registered and no OTLP connection is opened. | `false` |
+| `OTEL_SDK_DISABLED` | Set to `true` to turn telemetry off. No Prometheus collector is registered and no OTLP connection is opened. Read once at startup, so changing it needs a pod restart or rollout -- it is not a live kill switch. | `false` |
 | `OTEL_TRACES_SAMPLER` | Sampler name (e.g. `always_off`, `traceidratio`). When set, it replaces the binary's built-in sampler entirely. | unset (binary's own ratio applies) |
 | `OTEL_TRACES_SAMPLER_ARG` | Sampling ratio between 0 and 1. | binary's own ratio |
 

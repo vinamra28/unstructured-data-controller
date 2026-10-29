@@ -100,6 +100,57 @@ func TestTelemetryMiddlewareRecordsRegisteredToolName(t *testing.T) {
 		"error counter should not be recorded for a successful call")
 }
 
+// TestTelemetryMiddlewareBoundsUnknownToolNames is the cardinality guard. The
+// SDK rejects an unknown tool inside callTool, which runs after this
+// middleware, so an authenticated client could otherwise mint a fresh
+// Prometheus series and span name per request just by varying the string.
+func TestTelemetryMiddlewareBoundsUnknownToolNames(t *testing.T) {
+	provider, registry := setupTestProvider(t)
+
+	handler := func(context.Context, string, mcp.Request) (mcp.Result, error) {
+		return nil, errors.New(`unknown tool "nope"`)
+	}
+	wrapped := TelemetryMiddleware(provider)(handler)
+
+	// Distinct attacker-chosen names must collapse onto one series.
+	for _, name := range []string{"attacker-1", "attacker-2", "attacker-3"} {
+		_, err := wrapped(context.Background(), methodCallTool, toolCallRequest(name))
+		require.Error(t, err)
+		assert.Equal(t, float64(-1), counterValue(t, registry, "tool_calls", name),
+			"an unregistered name must never become a label value")
+	}
+
+	assert.Equal(t, float64(3), counterValue(t, registry, "tool_calls", toolNameUnknown),
+		"all unregistered names should collapse onto the bounded label")
+}
+
+func TestToolNameAllowList(t *testing.T) {
+	// Registered names pass through unchanged so dashboards stay meaningful.
+	for _, name := range []string{ToolListPipelines, ToolGetChunks, ToolGetProcessedDocument} {
+		assert.Equal(t, name, toolName(name))
+	}
+
+	for _, name := range []string{"", "nope", "List_Unstructured_Data_Pipelines_For_User", strings.Repeat("x", 500)} {
+		assert.Equal(t, toolNameUnknown, toolName(name),
+			"unregistered name %q must be bounded", name)
+	}
+}
+
+// The allow-list is maintained by hand, so this fails if a tool is registered
+// without being added to it.
+func TestRegisteredToolsCoversEveryRegisteredName(t *testing.T) {
+	server := mcp.NewServer(&mcp.Implementation{Name: "test", Version: "0"}, nil)
+	RegisterListPipelines(server, nil, nil)
+	RegisterGetChunksForEmbeddings(server, nil, nil, nil)
+	RegisterGetProcessedDocument(server, nil, nil)
+
+	for name := range registeredTools {
+		assert.Equal(t, name, toolName(name))
+	}
+	assert.Len(t, registeredTools, 3,
+		"a newly registered tool must also be added to registeredTools")
+}
+
 func TestTelemetryMiddlewareRecordsErrorResult(t *testing.T) {
 	provider, registry := setupTestProvider(t)
 

@@ -28,6 +28,41 @@ import (
 // SDK keeps its own copy of this constant unexported.
 const methodCallTool = "tools/call"
 
+// Tool names, shared between registration and telemetry so the two cannot
+// drift. Adding a tool means adding its name here and to registeredTools.
+const (
+	ToolListPipelines        = "list_unstructured_data_pipelines_for_user"
+	ToolGetChunks            = "get_chunks_for_embeddings"
+	ToolGetProcessedDocument = "get_processed_document"
+)
+
+// toolNameUnknown bounds the tool label and span name for calls naming a tool
+// that was never registered.
+//
+// The SDK rejects an unknown tool inside callTool, which runs *after*
+// receiving middleware, so by the time the request is refused this middleware
+// has already seen the name. Any authenticated client could otherwise mint a
+// new Prometheus series and a new span name per request just by varying the
+// string, growing the registry without bound. The angle brackets cannot
+// collide with a real tool name.
+const toolNameUnknown = "<unknown>"
+
+// registeredTools is the allow-list behind toolName. The SDK exposes no way to
+// enumerate what AddTool registered, so the set is maintained here.
+var registeredTools = map[string]bool{
+	ToolListPipelines:        true,
+	ToolGetChunks:            true,
+	ToolGetProcessedDocument: true,
+}
+
+// toolName maps an incoming tool name onto the bounded label set.
+func toolName(requested string) string {
+	if registeredTools[requested] {
+		return requested
+	}
+	return toolNameUnknown
+}
+
 // causeToolPanicked is recorded when a handler unwinds from a panic. The panic
 // value is deliberately not used: it can embed arbitrary downstream data, and
 // the span message is exported to Datadog and Langfuse.
@@ -52,7 +87,7 @@ func TelemetryMiddleware(metricsProvider *udctelemetry.Provider) mcp.Middleware 
 				return next(ctx, method, req)
 			}
 
-			ctx, endTool := metricsProvider.ToolObserver(ctx, callReq.Params.Name)
+			ctx, endTool := metricsProvider.ToolObserver(ctx, toolName(callReq.Params.Name))
 
 			// cause is resolved from the outcome on the way out. A panic skips
 			// that assignment, so it starts at the panic reason and is

@@ -19,6 +19,7 @@ package telemetry
 import (
 	"errors"
 	"regexp"
+	"strings"
 	"unicode/utf8"
 
 	"go.opentelemetry.io/otel/codes"
@@ -88,9 +89,31 @@ var secretRules = []struct {
 	},
 }
 
+// replacementChar is U+FFFD REPLACEMENT CHARACTER, the Unicode standard's
+// "undecodable input was here" marker. It substitutes each run of bytes that
+// is not valid UTF-8.
+//
+// This matters because OTLP span status and event fields are proto3 strings,
+// which the protobuf encoder refuses to marshal when they hold invalid UTF-8;
+// the batch processor then drops the whole batch rather than the one span
+// that caused it.
+//
+// Spelled as utf8.RuneError rather than a literal glyph so the source stays
+// ASCII and the intent is legible without rendering the character.
+const replacementChar = string(utf8.RuneError)
+
 // sanitize strips credential material from a message and truncates it so error
 // text recorded on spans cannot leak secrets to telemetry backends.
 func sanitize(msg string) string {
+	// Normalize before anything else. Truncating on a rune boundary is not
+	// enough on its own: a downstream error can carry invalid bytes anywhere
+	// in the message, including in messages short enough never to be
+	// truncated. Snowflake and HTTP clients echo raw response bytes, which are
+	// not guaranteed to be UTF-8.
+	if !utf8.ValidString(msg) {
+		msg = strings.ToValidUTF8(msg, replacementChar)
+	}
+
 	for _, rule := range secretRules {
 		msg = rule.pattern.ReplaceAllString(msg, rule.replacement)
 	}

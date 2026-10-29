@@ -110,11 +110,12 @@ func Init(ctx context.Context, cfg Config) (_ *Provider, retErr error) {
 		}))
 	}
 
-	// OTEL_SDK_DISABLED is the spec's kill switch, the one an operator reaches
-	// for to shed telemetry load without a redeploy. The Go SDK does not act on
-	// it, so it has to be handled here. Instruments are still built, against a
-	// no-op meter, so every recording site stays valid and no Prometheus
-	// collector or OTLP connection is created.
+	// OTEL_SDK_DISABLED is the spec's kill switch for shedding telemetry load.
+	// The Go SDK does not act on it, so it has to be handled here. It is read
+	// once, at startup: turning telemetry off takes a restart or a rollout,
+	// not just a config edit. Instruments are still built, against a no-op
+	// meter, so every recording site stays valid and no Prometheus collector
+	// or OTLP connection is created.
 	if disabled, parseErr := strconv.ParseBool(os.Getenv("OTEL_SDK_DISABLED")); parseErr == nil && disabled {
 		inst, instErr := newInstruments(metricnoop.NewMeterProvider())
 		if instErr != nil {

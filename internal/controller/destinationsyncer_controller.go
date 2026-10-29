@@ -137,11 +137,17 @@ func (r *DestinationSyncerReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		// udc.files.processed would mean something different here than it does
 		// in the other controllers, which all record true deltas.
 		uploadedCount, err := destination.SyncFilesToDestination(ctx, r.fileStore, filePaths)
+		// Accumulate before checking err. A sync that fails partway still
+		// uploaded uploadedCount files, and the next attempt skips them as
+		// unchanged, so discarding the count here would lose them for good and
+		// leave FilesProcessed permanently short of what is in the bucket.
+		totalFilesSynced += int64(uploadedCount)
 		if err != nil {
-			logger.Error(err, "failed to ingest files to destination", "stage", dep.Name)
+			logger.Error(err, "failed to ingest files to destination",
+				"stage", dep.Name, "uploaded", uploadedCount)
+			r.recordFilesSynced(ctx, destinationSyncCR, totalFilesSynced)
 			return r.handleError(ctx, destinationSyncCR, err)
 		}
-		totalFilesSynced += int64(uploadedCount)
 		logger.Info("successfully ingested files to destination",
 			"stage", dep.Name, "uploaded", uploadedCount, "listed", len(filePaths))
 	}
@@ -157,6 +163,30 @@ func (r *DestinationSyncerReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	r.Metrics.RecordFilesProcessed(ctx, DestinationSyncerControllerName, totalFilesSynced)
 
 	return ctrl.Result{}, nil
+}
+
+// recordFilesSynced persists a partial upload count on the error path, so
+// files that did reach the destination are still counted. The next attempt
+// skips them as unchanged and would never count them otherwise.
+//
+// The metric is recorded only once the status patch has succeeded, so a retry
+// after a failed patch cannot double-count. A patch failure here is logged
+// rather than returned: the caller is already on its way out with the
+// underlying sync error, which is the more useful one to surface.
+func (r *DestinationSyncerReconciler) recordFilesSynced(
+	ctx context.Context, destinationSyncCR *operatorv1alpha1.DestinationSyncer, count int64,
+) {
+	if count == 0 {
+		return
+	}
+	logger := log.FromContext(ctx)
+	if err := controllerutils.StatusPatch(ctx, r.Client, destinationSyncCR, func() {
+		destinationSyncCR.Status.FilesProcessed += count
+	}); err != nil {
+		logger.Error(err, "failed to persist partial file count after a sync error", "count", count)
+		return
+	}
+	r.Metrics.RecordFilesProcessed(ctx, DestinationSyncerControllerName, count)
 }
 
 func (r *DestinationSyncerReconciler) handleError(ctx context.Context, destinationSyncCR *operatorv1alpha1.DestinationSyncer, err error) (ctrl.Result, error) {

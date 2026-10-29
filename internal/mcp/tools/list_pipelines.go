@@ -69,7 +69,7 @@ func RegisterListPipelines(
 	s *mcp.Server, k8sClient *k8sclient.Client, metricsProvider *udctelemetry.Provider,
 ) {
 	mcp.AddTool(s, &mcp.Tool{
-		Name: "list_unstructured_data_pipelines_for_user",
+		Name: ToolListPipelines,
 		Description: `List the UnstructuredDataPipelines the authenticated user has access to. Returns an array of {name, description, guidance}.
 If EXACTLY ONE pipeline matches the user's question, use it.
 If MORE THAN ONE pipeline could match, STOP and ask the user which one to use. Do NOT pick one yourself.

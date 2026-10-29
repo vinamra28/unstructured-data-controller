@@ -269,6 +269,41 @@ func TestSanitizeTruncatesOnARuneBoundary(t *testing.T) {
 	}
 }
 
+// TestSanitizeNormalizesInvalidUTF8 covers invalid bytes anywhere in the
+// message, not just at the truncation boundary. Downstream clients echo raw
+// response bytes that are not guaranteed to be UTF-8, and a short message
+// never reaches the length cap at all, so boundary handling alone leaves the
+// OTLP trace export rejecting the batch.
+func TestSanitizeNormalizesInvalidUTF8(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{name: "short message, never truncated", input: "snowflake error: \xff\xfe bad bytes"},
+		{name: "invalid bytes before the cap", input: "err \xff\xfe " + strings.Repeat("a", 400)},
+		{name: "lone continuation byte", input: "response: \x80"},
+		{name: "truncated multibyte sequence mid-message", input: "prefix \xe6\x97 suffix"},
+		{name: "invalid bytes around a secret", input: "\xffpassword=hunter2\xfe"},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			got := sanitize(testCase.input)
+			assert.True(t, utf8.ValidString(got),
+				"sanitize must emit valid UTF-8, got %q", got)
+		})
+	}
+}
+
+// Redaction has to keep working once invalid bytes have been replaced.
+func TestSanitizeRedactsAroundInvalidUTF8(t *testing.T) {
+	got := sanitize("\xffconnect failed: password=hunter2\xfe")
+
+	require.True(t, utf8.ValidString(got))
+	assert.NotContains(t, got, "hunter2")
+	assert.Contains(t, got, redacted)
+}
+
 func TestSanitizeKeepsShortMultibyteMessagesIntact(t *testing.T) {
 	msg := "ドキュメント処理に失敗しました"
 	assert.Equal(t, msg, sanitize(msg))

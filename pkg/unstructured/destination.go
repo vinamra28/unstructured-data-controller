@@ -110,7 +110,7 @@ func (d *S3Destination) SyncFilesToDestination(ctx context.Context, fs *filestor
 			if notFoundErr.ErrorCode() != "NotFound" {
 				logger.Info("error while fetching the object",
 					"key", key, "error", err.Error())
-				return uploaded, err
+				return uploaded, fmt.Errorf("head object s3://%s/%s: %w", d.Bucket, key, err)
 			}
 		}
 

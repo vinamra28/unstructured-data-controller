@@ -53,7 +53,7 @@ func RegisterGetChunksForEmbeddings(
 	metricsProvider *udctelemetry.Provider,
 ) {
 	mcp.AddTool(s, &mcp.Tool{
-		Name: "get_chunks_for_embeddings",
+		Name: ToolGetChunks,
 		Description: `Search for relevant text chunks in a pipeline's data product using vector cosine similarity. Optionally scope the search to specific files using file_path_filter with glob patterns (e.g. "*/README.md", "*/aemv2/*").
 If pipeline_name is not known, call list_unstructured_data_pipelines_for_user first and follow the instructions in its response.
 If the returned chunks are not sufficient to answer the user's question, you may call get_processed_document with the same pipeline_name and the file_id from the top matching chunk to retrieve the full processed document for more context.

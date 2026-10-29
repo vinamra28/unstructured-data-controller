@@ -52,7 +52,7 @@ func RegisterGetProcessedDocument(
 	s *mcp.Server, k8sClient *k8sclient.Client, metricsProvider *udctelemetry.Provider,
 ) {
 	mcp.AddTool(s, &mcp.Tool{
-		Name: "get_processed_document",
+		Name: ToolGetProcessedDocument,
 		Description: `Retrieve processed document output from a pipeline's DocumentProcessor stage. Supports exact lookup via file_id or glob pattern matching via file_path_filter (e.g. "*/README.md"). At least one of file_id or file_path_filter is required.
 If pipeline_name is not known, call list_unstructured_data_pipelines_for_user first and follow the instructions in its response.
 On error: report the exact error to the user and STOP. Do NOT retry with other pipelines.`,
