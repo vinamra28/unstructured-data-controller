@@ -25,6 +25,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -39,7 +40,11 @@ import (
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/gdrive/google"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/gdrive/ldap"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/langchain"
+	udctelemetry "github.com/redhat-data-and-ai/unstructured-data-controller/pkg/telemetry"
 )
+
+// ControllerConfigControllerName identifies this controller in metric labels.
+const ControllerConfigControllerName = "ControllerConfig"
 
 type Model string
 
@@ -79,6 +84,8 @@ var (
 type ControllerConfigReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	// Metrics records reconcile telemetry. Nil disables recording.
+	Metrics *udctelemetry.Provider
 }
 
 // +kubebuilder:rbac:groups=operator.dataverse.redhat.com,namespace=unstructured-controller-namespace,resources=controllerconfigs,verbs=get;list;watch;create;update;patch;delete
@@ -86,10 +93,7 @@ type ControllerConfigReconciler struct {
 // +kubebuilder:rbac:groups=operator.dataverse.redhat.com,namespace=unstructured-controller-namespace,resources=controllerconfigs/finalizers,verbs=update
 
 func (r *ControllerConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, retErr error) {
-	if metricsProvider != nil {
-		obs := metricsProvider.ReconcileObserver("ControllerConfig")
-		defer obs.End(ctx, &retErr)
-	}
+	defer r.Metrics.ReconcileObserver(ControllerConfigControllerName).End(ctx, &retErr)
 	logger := log.FromContext(ctx)
 	logger.Info(fmt.Sprintf("Reconciling controller config %s", req.NamespacedName))
 

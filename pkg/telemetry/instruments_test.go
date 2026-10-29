@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package metrics
+package telemetry
 
 import (
 	"context"
@@ -37,12 +37,12 @@ func setupTestProvider(t *testing.T) (*Provider, *sdkmetric.ManualReader) {
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 
-	instruments, err := newInstruments(mp)
+	inst, err := newInstruments(mp)
 	require.NoError(t, err)
 
 	return &Provider{
 		meterProvider: mp,
-		Instruments:   instruments,
+		instruments:   inst,
 	}, reader
 }
 
@@ -182,7 +182,7 @@ func TestToolObserver(t *testing.T) {
 	require.NotNil(t, ctx, "context should not be nil")
 
 	time.Sleep(5 * time.Millisecond)
-	endTool(false)
+	endTool("")
 
 	rm := collectMetrics(t, reader)
 
@@ -221,7 +221,7 @@ func TestToolObserverWithError(t *testing.T) {
 	_, endTool := p.ToolObserver(
 		context.Background(), "failing_tool",
 	)
-	endTool(true)
+	endTool("snowflake query failed")
 
 	rm := collectMetrics(t, reader)
 
@@ -282,4 +282,47 @@ func TestRecordExternalCallWithError(t *testing.T) {
 	hist := requireHistogramMetric(t, rm, "udc.mcp.external.duration")
 	require.Len(t, hist.DataPoints, 1)
 	assert.Greater(t, hist.DataPoints[0].Sum, 0.0)
+}
+
+// A nil Provider is the "telemetry disabled" case. Callers invoke these
+// methods without nil guards, so every one must tolerate a nil receiver.
+func TestNilProviderIsSafe(t *testing.T) {
+	var p *Provider
+	ctx := context.Background()
+
+	assert.NotPanics(t, func() {
+		var retErr error
+		p.ReconcileObserver("AnyController").End(ctx, &retErr)
+	}, "ReconcileObserver/End must tolerate a nil Provider")
+
+	assert.NotPanics(t, func() {
+		p.RecordFilesProcessed(ctx, "AnyController", 3)
+	}, "RecordFilesProcessed must tolerate a nil Provider")
+
+	assert.NotPanics(t, func() {
+		p.RecordExternalCall(ctx, "snowflake", "query", time.Second, errors.New("boom"))
+	}, "RecordExternalCall must tolerate a nil Provider")
+
+	assert.NotPanics(t, func() {
+		gotCtx, endTool := p.ToolObserver(ctx, "any_tool")
+		assert.Equal(t, ctx, gotCtx, "nil Provider should return the context unchanged")
+		endTool("some failure")
+	}, "ToolObserver must tolerate a nil Provider")
+}
+
+func TestToolObserverRecordsSanitizedCause(t *testing.T) {
+	p, reader := setupTestProvider(t)
+	defer func() {
+		require.NoError(t, p.meterProvider.Shutdown(context.Background()))
+	}()
+
+	_, endTool := p.ToolObserver(context.Background(), "get_chunks")
+	endTool("snowflake auth failed: password=hunter2")
+
+	rm := collectMetrics(t, reader)
+
+	errSum := requireSumMetric(t, rm, "udc.mcp.tool.errors")
+	require.Len(t, errSum.DataPoints, 1)
+	assert.Equal(t, int64(1), errSum.DataPoints[0].Value,
+		"a non-empty cause should count as a failed tool call")
 }

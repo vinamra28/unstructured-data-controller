@@ -29,6 +29,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -45,6 +46,7 @@ import (
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/gdrive/google"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/gitclient"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/pathfilter"
+	udctelemetry "github.com/redhat-data-and-ai/unstructured-data-controller/pkg/telemetry"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/unstructured"
 )
 
@@ -57,7 +59,9 @@ const (
 // SourceCrawlerReconciler reconciles a SourceCrawler object
 type SourceCrawlerReconciler struct {
 	client.Client
-	Scheme    *runtime.Scheme
+	Scheme *runtime.Scheme
+	// Metrics records reconcile telemetry. Nil disables recording.
+	Metrics   *udctelemetry.Provider
 	fileStore *filestore.FileStore
 }
 
@@ -67,10 +71,7 @@ type SourceCrawlerReconciler struct {
 // +kubebuilder:rbac:groups="",namespace=unstructured-controller-namespace,resources=secrets,verbs=get;list;watch
 
 func (r *SourceCrawlerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, retErr error) {
-	if metricsProvider != nil {
-		obs := metricsProvider.ReconcileObserver(SourceCrawlerControllerName)
-		defer obs.End(ctx, &retErr)
-	}
+	defer r.Metrics.ReconcileObserver(SourceCrawlerControllerName).End(ctx, &retErr)
 	logger := log.FromContext(ctx)
 	logger.Info("reconciling", "controller", SourceCrawlerControllerName)
 
@@ -206,9 +207,7 @@ func (r *SourceCrawlerReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		logger.Error(err, "failed to update SourceCrawler CR status")
 		return ctrl.Result{}, r.handleError(ctx, sourceCrawlerCR, err)
 	}
-	if metricsProvider != nil {
-		metricsProvider.RecordFilesProcessed(ctx, SourceCrawlerControllerName, storedCount)
-	}
+	r.Metrics.RecordFilesProcessed(ctx, SourceCrawlerControllerName, storedCount)
 
 	// determine requeue strategy
 	if sourceCrawlerConfig.Type == operatorv1alpha1.TypeS3 {

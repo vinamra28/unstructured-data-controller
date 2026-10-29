@@ -33,7 +33,7 @@ import (
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/embedding"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/k8sclient"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/logger"
-	udcmetrics "github.com/redhat-data-and-ai/unstructured-data-controller/pkg/metrics"
+	udctelemetry "github.com/redhat-data-and-ai/unstructured-data-controller/pkg/telemetry"
 	ctrl "sigs.k8s.io/controller-runtime"
 )
 
@@ -50,10 +50,14 @@ func main() {
 
 	// Initialize OTel metrics and tracing. Prometheus metrics are served on /metrics.
 	// OTLP push (for Datadog/Langfuse) activates when OTEL_EXPORTER_OTLP_ENDPOINT is set.
-	metricsProvider, err := udcmetrics.Init(
-		context.Background(), udcmetrics.Config{
+	metricsProvider, err := udctelemetry.Init(
+		context.Background(), udctelemetry.Config{
 			ServiceName:    serverName,
 			ServiceVersion: serverVersion,
+			// Tool calls are user-driven and low volume compared to reconcile
+			// loops, and Langfuse usage analytics need every invocation to get
+			// accurate counts. Export all traces.
+			TraceSampleRatio: 1.0,
 		},
 	)
 	if err != nil {
@@ -155,7 +159,11 @@ func main() {
 		Addr:              metricsAddr,
 		Handler:           metricsMux,
 		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       30 * time.Second,
+		// /metrics is unauthenticated and returns a finite, non-streaming
+		// response. IdleTimeout does not bound an active write, so without this
+		// a slow scrape client could hold the connection open indefinitely.
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  30 * time.Second,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

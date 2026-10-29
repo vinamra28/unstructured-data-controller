@@ -26,6 +26,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/util/retry"
+
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -35,6 +36,7 @@ import (
 
 	operatorv1alpha1 "github.com/redhat-data-and-ai/unstructured-data-controller/api/v1alpha1"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/internal/controller/controllerutils"
+	udctelemetry "github.com/redhat-data-and-ai/unstructured-data-controller/pkg/telemetry"
 )
 
 const (
@@ -51,6 +53,8 @@ var (
 type UnstructuredDataPipelineReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	// Metrics records reconcile telemetry. Nil disables recording.
+	Metrics *udctelemetry.Provider
 }
 
 // +kubebuilder:rbac:groups=operator.dataverse.redhat.com,namespace=unstructured-controller-namespace,resources=unstructureddatapipelines,verbs=get;list;watch;create;update;patch;delete
@@ -68,10 +72,7 @@ type UnstructuredDataPipelineReconciler struct {
 // +kubebuilder:rbac:groups=operator.dataverse.redhat.com,namespace=unstructured-controller-namespace,resources=destinationsyncers/status,verbs=get
 
 func (r *UnstructuredDataPipelineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, retErr error) {
-	if metricsProvider != nil {
-		obs := metricsProvider.ReconcileObserver(UnstructuredDataPipelineControllerName)
-		defer obs.End(ctx, &retErr)
-	}
+	defer r.Metrics.ReconcileObserver(UnstructuredDataPipelineControllerName).End(ctx, &retErr)
 	logger := log.FromContext(ctx)
 	logger.Info("reconciling", "controller", UnstructuredDataPipelineControllerName)
 

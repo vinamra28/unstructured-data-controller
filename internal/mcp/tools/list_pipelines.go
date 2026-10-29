@@ -31,8 +31,8 @@ import (
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/auth"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/k8sclient"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/logger"
-	udcmetrics "github.com/redhat-data-and-ai/unstructured-data-controller/pkg/metrics"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/snowflake"
+	udctelemetry "github.com/redhat-data-and-ai/unstructured-data-controller/pkg/telemetry"
 )
 
 type pipelineFilterCtxKey struct{}
@@ -65,7 +65,9 @@ func isPipelineAllowed(ctx context.Context, pipelineName string) bool {
 }
 
 // RegisterListPipelines registers the list_unstructured_data_pipelines_for_user MCP tool
-func RegisterListPipelines(s *mcp.Server, k8sClient *k8sclient.Client, mp *udcmetrics.Provider) {
+func RegisterListPipelines(
+	s *mcp.Server, k8sClient *k8sclient.Client, metricsProvider *udctelemetry.Provider,
+) {
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "list_unstructured_data_pipelines_for_user",
 		Description: `List the UnstructuredDataPipelines the authenticated user has access to. Returns an array of {name, description, guidance}.
@@ -81,11 +83,9 @@ If the pipeline has a "guidance" field, follow those instructions when working w
 		ctx = logger.NewContext(ctx, uuid.NewString(), "list_unstructured_data_pipelines_for_user", username)
 		log := logger.FromContext(ctx)
 
-		if mp != nil {
-			var endTool func(bool)
-			ctx, endTool = mp.ToolObserver(ctx, "list_pipelines")
-			defer func() { endTool(res != nil && res.IsError) }()
-		}
+		var endTool func(cause string)
+		ctx, endTool = metricsProvider.ToolObserver(ctx, "list_pipelines")
+		defer func() { endTool(toolFailureCause(res)) }()
 
 		log.Info("tool invoked")
 
@@ -112,9 +112,7 @@ If the pipeline has a "guidance" field, follow those instructions when working w
 
 		k8sStart := time.Now()
 		pipelines, err := k8sClient.ListPipelines(ctx)
-		if mp != nil {
-			mp.RecordExternalCall(ctx, "k8s", "list_pipelines", time.Since(k8sStart), err)
-		}
+		metricsProvider.RecordExternalCall(ctx, "k8s", "list_pipelines", time.Since(k8sStart), err)
 		if err != nil {
 			log.Error("failed to list pipelines from kubernetes", "error", err)
 			return &mcp.CallToolResult{
@@ -128,9 +126,7 @@ If the pipeline has a "guidance" field, follow those instructions when working w
 
 		sfStart := time.Now()
 		databases, err := snowflake.ShowDatabases(ctx, oauthToken)
-		if mp != nil {
-			mp.RecordExternalCall(ctx, "snowflake", "show_databases", time.Since(sfStart), err)
-		}
+		metricsProvider.RecordExternalCall(ctx, "snowflake", "show_databases", time.Since(sfStart), err)
 		if err != nil {
 			log.Error("failed to list databases from snowflake", "error", err)
 			return &mcp.CallToolResult{

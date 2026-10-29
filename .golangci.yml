@@ -91,10 +91,6 @@ linters:
         path: test/
         text: "var-naming"
       - linters:
-          - revive
-        path: pkg/metrics/
-        text: "var-naming"
-      - linters:
           - unparam
         path: internal/controller/
         text: "handleError"

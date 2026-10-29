@@ -26,6 +26,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -38,6 +39,7 @@ import (
 	"github.com/redhat-data-and-ai/unstructured-data-controller/internal/controller/controllerutils"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/embedding"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/filestore"
+	udctelemetry "github.com/redhat-data-and-ai/unstructured-data-controller/pkg/telemetry"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/unstructured"
 )
 
@@ -47,7 +49,9 @@ const (
 
 type VectorEmbeddingsGeneratorReconciler struct {
 	client.Client
-	Scheme    *runtime.Scheme
+	Scheme *runtime.Scheme
+	// Metrics records reconcile telemetry. Nil disables recording.
+	Metrics   *udctelemetry.Provider
 	fileStore *filestore.FileStore
 }
 
@@ -56,10 +60,7 @@ type VectorEmbeddingsGeneratorReconciler struct {
 // +kubebuilder:rbac:groups=operator.dataverse.redhat.com,namespace=unstructured-controller-namespace,resources=vectorembeddingsgenerators/finalizers,verbs=update
 
 func (r *VectorEmbeddingsGeneratorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, retErr error) {
-	if metricsProvider != nil {
-		obs := metricsProvider.ReconcileObserver(VectorEmbeddingsGeneratorControllerName)
-		defer obs.End(ctx, &retErr)
-	}
+	defer r.Metrics.ReconcileObserver(VectorEmbeddingsGeneratorControllerName).End(ctx, &retErr)
 	logger := log.FromContext(ctx)
 	logger.Info("reconciling", "controller", VectorEmbeddingsGeneratorControllerName)
 
@@ -148,9 +149,7 @@ func (r *VectorEmbeddingsGeneratorReconciler) Reconcile(ctx context.Context, req
 		logger.Error(err, "failed to update VectorEmbeddingsGenerator CR status", "namespace", vectorEmbeddingsGeneratorCR.Namespace, "name", vectorEmbeddingsGeneratorCR.Name)
 		return r.handleError(ctx, vectorEmbeddingsGeneratorCR, err)
 	}
-	if metricsProvider != nil {
-		metricsProvider.RecordFilesProcessed(ctx, VectorEmbeddingsGeneratorControllerName, filesProcessed)
-	}
+	r.Metrics.RecordFilesProcessed(ctx, VectorEmbeddingsGeneratorControllerName, filesProcessed)
 	logger.Info("successfully updated VectorEmbeddingsGenerator CR status", "status", vectorEmbeddingsGeneratorCR.Status)
 
 	return ctrl.Result{}, nil

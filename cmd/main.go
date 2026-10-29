@@ -41,7 +41,7 @@ import (
 
 	operatorv1alpha1 "github.com/redhat-data-and-ai/unstructured-data-controller/api/v1alpha1"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/internal/controller"
-	udcmetrics "github.com/redhat-data-and-ai/unstructured-data-controller/pkg/metrics"
+	udctelemetry "github.com/redhat-data-and-ai/unstructured-data-controller/pkg/telemetry"
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	// +kubebuilder:scaffold:imports
 )
@@ -99,10 +99,14 @@ func main() {
 	// controller-runtime's Prometheus registry so they appear on the existing
 	// /metrics endpoint alongside built-in metrics (reconcile counts, work queue depth).
 	// OTLP push to a collector activates when OTEL_EXPORTER_OTLP_ENDPOINT is set.
-	metricsProvider, err := udcmetrics.Init(context.Background(), udcmetrics.Config{
+	metricsProvider, err := udctelemetry.Init(context.Background(), udctelemetry.Config{
 		ServiceName:          "unstructured-data-controller",
 		ServiceVersion:       "0.1.0",
 		PrometheusRegisterer: crmetrics.Registry,
+		// Reconcile loops run continuously across every watched resource, so
+		// exporting every trace would flood the collector. Operators can raise
+		// this at runtime with OTEL_TRACES_SAMPLER_ARG when debugging.
+		TraceSampleRatio: 0.1,
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to initialize metrics provider")
@@ -227,56 +231,61 @@ func main() {
 		os.Exit(1)
 	}
 
-	controller.SetMetricsProvider(metricsProvider)
-
 	if err := (&controller.ControllerConfigReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:  mgr.GetClient(),
+		Scheme:  mgr.GetScheme(),
+		Metrics: metricsProvider,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ControllerConfig")
 		os.Exit(1)
 	}
 
 	if err := (&controller.UnstructuredDataPipelineReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:  mgr.GetClient(),
+		Scheme:  mgr.GetScheme(),
+		Metrics: metricsProvider,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "UnstructuredDataPipeline")
 		os.Exit(1)
 	}
 
 	if err := (&controller.DocumentProcessorReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:  mgr.GetClient(),
+		Scheme:  mgr.GetScheme(),
+		Metrics: metricsProvider,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "DocumentProcessor")
 		os.Exit(1)
 	}
 
 	if err := (&controller.ChunksGeneratorReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:  mgr.GetClient(),
+		Scheme:  mgr.GetScheme(),
+		Metrics: metricsProvider,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ChunksGenerator")
 		os.Exit(1)
 	}
 	if err := (&controller.VectorEmbeddingsGeneratorReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:  mgr.GetClient(),
+		Scheme:  mgr.GetScheme(),
+		Metrics: metricsProvider,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "VectorEmbeddingsGenerator")
 		os.Exit(1)
 	}
 	if err := (&controller.SourceCrawlerReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:  mgr.GetClient(),
+		Scheme:  mgr.GetScheme(),
+		Metrics: metricsProvider,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "SourceCrawler")
 		os.Exit(1)
 	}
 	if err := (&controller.DestinationSyncerReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:  mgr.GetClient(),
+		Scheme:  mgr.GetScheme(),
+		Metrics: metricsProvider,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "DestinationSyncer")
 		os.Exit(1)

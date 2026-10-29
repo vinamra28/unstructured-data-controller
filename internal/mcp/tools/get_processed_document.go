@@ -32,8 +32,8 @@ import (
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/auth"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/k8sclient"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/logger"
-	udcmetrics "github.com/redhat-data-and-ai/unstructured-data-controller/pkg/metrics"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/snowflake"
+	udctelemetry "github.com/redhat-data-and-ai/unstructured-data-controller/pkg/telemetry"
 )
 
 const (
@@ -47,7 +47,9 @@ type getProcessedDocumentArgs struct {
 	FilePathFilter string `json:"file_path_filter,omitempty" jsonschema:"Glob pattern to retrieve processed documents from files matching this path. Use * to match any path segment. Examples: '*/README.md', '*/aemv2/*'."`
 }
 
-func RegisterGetProcessedDocument(s *mcp.Server, k8sClient *k8sclient.Client, mp *udcmetrics.Provider) {
+func RegisterGetProcessedDocument(
+	s *mcp.Server, k8sClient *k8sclient.Client, metricsProvider *udctelemetry.Provider,
+) {
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "get_processed_document",
 		Description: `Retrieve processed document output from a pipeline's DocumentProcessor stage. Supports exact lookup via file_id or glob pattern matching via file_path_filter (e.g. "*/README.md"). At least one of file_id or file_path_filter is required.
@@ -61,14 +63,12 @@ On error: report the exact error to the user and STOP. Do NOT retry with other p
 		ctx = logger.NewContext(ctx, uuid.NewString(), "get_processed_document", username)
 		log := logger.FromContext(ctx)
 
-		if mp != nil {
-			var endTool func(bool)
-			ctx, endTool = mp.ToolObserver(ctx, "get_processed_document",
-				attribute.String("mcp.pipeline_name", args.PipelineName),
-				attribute.String("mcp.file_id", args.FileID),
-				attribute.String("mcp.file_path_filter", args.FilePathFilter))
-			defer func() { endTool(res != nil && res.IsError) }()
-		}
+		var endTool func(cause string)
+		ctx, endTool = metricsProvider.ToolObserver(ctx, "get_processed_document",
+			attribute.String("mcp.pipeline_name", args.PipelineName),
+			attribute.String("mcp.file_id", args.FileID),
+			attribute.String("mcp.file_path_filter", args.FilePathFilter))
+		defer func() { endTool(toolFailureCause(res)) }()
 
 		log.Info("tool invoked", "pipeline_name", args.PipelineName, "file_id", args.FileID, "file_path_filter", args.FilePathFilter)
 
@@ -107,9 +107,7 @@ On error: report the exact error to the user and STOP. Do NOT retry with other p
 
 		k8sStart := time.Now()
 		qc, err := k8sClient.GetPipelineQueryConfig(ctx, args.PipelineName, operatorv1alpha1.StageTypeDocumentProcessor)
-		if mp != nil {
-			mp.RecordExternalCall(ctx, "k8s", "get_pipeline_query_config", time.Since(k8sStart), err)
-		}
+		metricsProvider.RecordExternalCall(ctx, "k8s", "get_pipeline_query_config", time.Since(k8sStart), err)
 		if err != nil {
 			log.Error("failed to get pipeline query config", "error", err)
 			return &mcp.CallToolResult{
@@ -137,9 +135,7 @@ On error: report the exact error to the user and STOP. Do NOT retry with other p
 			log.Info("querying snowflake by file_id", "database", databaseName, "schema", schemaName, "table", tableName, "file_id", args.FileID)
 			sfStart := time.Now()
 			doc, queryErr := snowflake.GetProcessedDocument(ctx, oauthToken, databaseName, schemaName, tableName, args.FileID)
-			if mp != nil {
-				mp.RecordExternalCall(ctx, "snowflake", "get_processed_document", time.Since(sfStart), queryErr)
-			}
+			metricsProvider.RecordExternalCall(ctx, "snowflake", "get_processed_document", time.Since(sfStart), queryErr)
 			if queryErr != nil {
 				log.Error("failed to get processed document", "error", queryErr)
 				return &mcp.CallToolResult{
@@ -154,9 +150,7 @@ On error: report the exact error to the user and STOP. Do NOT retry with other p
 			log.Info("querying snowflake by file path pattern", "database", databaseName, "schema", schemaName, "table", tableName, "filePattern", filePattern)
 			sfStart := time.Now()
 			count, countErr := snowflake.CountProcessedDocumentsByFilePath(ctx, oauthToken, databaseName, schemaName, tableName, filePattern)
-			if mp != nil {
-				mp.RecordExternalCall(ctx, "snowflake", "count_processed_documents_by_file_path", time.Since(sfStart), countErr)
-			}
+			metricsProvider.RecordExternalCall(ctx, "snowflake", "count_processed_documents_by_file_path", time.Since(sfStart), countErr)
 			if countErr != nil {
 				log.Error("failed to count matching documents", "error", countErr)
 				return &mcp.CallToolResult{

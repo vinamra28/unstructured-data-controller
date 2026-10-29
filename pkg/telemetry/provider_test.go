@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package metrics
+package telemetry
 
 import (
 	"context"
@@ -28,9 +28,24 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
 )
 
+// preserveGlobals restores the process-wide OTel providers after a test.
+// Init replaces them, so without this a shut-down provider would leak into
+// subsequent tests in the package.
+func preserveGlobals(t *testing.T) {
+	t.Helper()
+	origMeterProvider := otel.GetMeterProvider()
+	origTracerProvider := otel.GetTracerProvider()
+	t.Cleanup(func() {
+		otel.SetMeterProvider(origMeterProvider)
+		otel.SetTracerProvider(origTracerProvider)
+	})
+}
+
 func TestInitWithDefaults(t *testing.T) {
+	preserveGlobals(t)
 	// Without OTEL_EXPORTER_OTLP_ENDPOINT, only Prometheus export should be active.
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
 
@@ -43,10 +58,11 @@ func TestInitWithDefaults(t *testing.T) {
 
 	assert.NotNil(t, p.meterProvider, "MeterProvider should be initialized")
 	assert.NotNil(t, p.tracerProvider, "TracerProvider should be initialized")
-	assert.NotNil(t, p.Instruments, "Instruments should be initialized")
+	assert.NotNil(t, p.instruments, "instruments should be initialized")
 }
 
 func TestInitWithExternalRegisterer(t *testing.T) {
+	preserveGlobals(t)
 	// Simulates the controller case: pass an existing Prometheus registry.
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
 	reg := prometheus.NewRegistry()
@@ -65,6 +81,7 @@ func TestInitWithExternalRegisterer(t *testing.T) {
 }
 
 func TestPrometheusHandlerServesMetrics(t *testing.T) {
+	preserveGlobals(t)
 	// Simulates the MCP server case: no external registerer, so we create our own.
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
 
@@ -96,6 +113,7 @@ func TestPrometheusHandlerServesMetrics(t *testing.T) {
 }
 
 func TestShutdownIsIdempotent(t *testing.T) {
+	preserveGlobals(t)
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
 
 	p, err := Init(context.Background(), Config{
@@ -111,6 +129,7 @@ func TestShutdownIsIdempotent(t *testing.T) {
 }
 
 func TestStartBlocksUntilContextCancelled(t *testing.T) {
+	preserveGlobals(t)
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
 
 	p, err := Init(context.Background(), Config{

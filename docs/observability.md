@@ -4,7 +4,7 @@ The Unstructured Data Controller and MCP Server include built-in observability v
 
 ## How It Works
 
-Both binaries use the shared `pkg/metrics` package which initializes the OTel SDK with dual export:
+Both binaries use the shared `pkg/telemetry` package which initializes the OTel SDK with dual export:
 
 - **Prometheus export (always on)** -- custom metrics are served on a `/metrics` HTTP endpoint in Prometheus format. For the controller, they appear alongside controller-runtime's built-in metrics (work queue depth, reconcile counts, etc.). For the MCP server, a dedicated `/metrics` endpoint is exposed on a separate port (8000) to isolate it from the MCP protocol traffic on port 8080.
 
@@ -127,49 +127,59 @@ Traces are useful for Langfuse integration (LLM observability) and debugging lat
 
 Add named returns and a `ReconcileObserver` defer at the top of the `Reconcile` method:
 
+Add a `Metrics *udctelemetry.Provider` field to the reconciler struct, then use
+named returns with a `ReconcileObserver` defer at the top of `Reconcile`:
+
 ```go
+type MyReconciler struct {
+    client.Client
+    Scheme *runtime.Scheme
+    // Metrics records reconcile telemetry. Nil disables recording.
+    Metrics *udctelemetry.Provider
+}
+
 func (r *MyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, retErr error) {
-    if metricsProvider != nil {
-        obs := metricsProvider.ReconcileObserver("MyController")
-        defer obs.End(ctx, &retErr)
-    }
+    defer r.Metrics.ReconcileObserver(MyControllerName).End(ctx, &retErr)
     // ... existing reconcile logic ...
 }
 ```
 
-To track files processed, call `RecordFilesProcessed` next to the status update:
+To track files processed, call `RecordFilesProcessed` *after* the status patch
+succeeds, so a failed patch followed by a retry does not double-count:
 
 ```go
-cr.Status.FilesProcessed += count
-if metricsProvider != nil {
-    metricsProvider.RecordFilesProcessed(ctx, "MyController", count)
+if err := controllerutils.StatusPatch(ctx, r.Client, cr, func() {
+    cr.Status.FilesProcessed += count
+}); err != nil {
+    return r.handleError(ctx, cr, err)
 }
+r.Metrics.RecordFilesProcessed(ctx, MyControllerName, count)
 ```
 
-The `metricsProvider` package-level variable is set at startup via `SetMetricsProvider()` in `internal/controller/telemetry.go`. The nil guard ensures controllers work without metrics during tests.
+Wire the provider in `cmd/main.go` when constructing the reconciler. Every
+`Provider` method is nil-safe, so no nil guards are needed at recording sites
+and reconcilers work unchanged when telemetry is disabled in tests.
 
 ### New MCP tool
 
-Add the `*udcmetrics.Provider` parameter to the Register function and use `ToolObserver` + `RecordExternalCall`:
+Add a `*udctelemetry.Provider` parameter to the Register function and use
+`ToolObserver` + `RecordExternalCall`:
 
 ```go
-func RegisterMyTool(s *mcp.Server, mp *udcmetrics.Provider) {
+func RegisterMyTool(s *mcp.Server, metricsProvider *udctelemetry.Provider) {
     mcp.AddTool(s, &mcp.Tool{...},
         func(ctx context.Context, ...) (res *mcp.CallToolResult, _ any, _ error) {
-        if mp != nil {
-            var endTool func(bool)
-            ctx, endTool = mp.ToolObserver(ctx, "my_tool",
-                attribute.String("mcp.pipeline_name", args.PipelineName))
-            // Derive error flag from the returned result's IsError field.
-            defer func() { endTool(res != nil && res.IsError) }()
-        }
+        // toolFailureCause pulls the reason out of the result so the span
+        // records why the call failed, not just that it did.
+        var endTool func(cause string)
+        ctx, endTool = metricsProvider.ToolObserver(ctx, "my_tool",
+            attribute.String("mcp.pipeline_name", args.PipelineName))
+        defer func() { endTool(toolFailureCause(res)) }()
 
         // Time external calls:
         start := time.Now()
         result, err := externalService.Call(ctx, ...)
-        if mp != nil {
-            mp.RecordExternalCall(ctx, "service_name", "operation", time.Since(start), err)
-        }
+        metricsProvider.RecordExternalCall(ctx, "service_name", "operation", time.Since(start), err)
         if err != nil {
             return errorResult, nil, nil
         }
@@ -178,9 +188,13 @@ func RegisterMyTool(s *mcp.Server, mp *udcmetrics.Provider) {
 }
 ```
 
+Error text recorded on spans is passed through `sanitize()` first, which
+redacts credential material (URL userinfo, bearer tokens, `password=`/`token=`
+pairs) and truncates oversized messages before they reach Datadog or Langfuse.
+
 ### New pkg/ function with external calls
 
-Add a trace span using the global `otel.Tracer()` API. No import of `internal/` or `pkg/metrics` needed -- the span propagates automatically when the caller has an active span:
+Add a trace span using the global `otel.Tracer()` API. No import of `internal/` or `pkg/telemetry` needed -- the span propagates automatically when the caller has an active span:
 
 ```go
 func MyExternalCall(ctx context.Context, ...) (result T, err error) {
@@ -238,7 +252,7 @@ The collector logs will show received metric data points.
 ### Unit tests
 
 ```bash
-go test -v ./pkg/metrics/
+go test -v ./pkg/telemetry/
 ```
 
 ## Architecture Decisions

@@ -34,8 +34,8 @@ import (
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/embedding"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/k8sclient"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/logger"
-	udcmetrics "github.com/redhat-data-and-ai/unstructured-data-controller/pkg/metrics"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/snowflake"
+	udctelemetry "github.com/redhat-data-and-ai/unstructured-data-controller/pkg/telemetry"
 )
 
 type getChunksArgs struct {
@@ -46,7 +46,10 @@ type getChunksArgs struct {
 }
 
 func RegisterGetChunksForEmbeddings(
-	s *mcp.Server, k8sClient *k8sclient.Client, embeddingClient *embedding.HTTPClient, mp *udcmetrics.Provider,
+	s *mcp.Server,
+	k8sClient *k8sclient.Client,
+	embeddingClient *embedding.HTTPClient,
+	metricsProvider *udctelemetry.Provider,
 ) {
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "get_chunks_for_embeddings",
@@ -63,12 +66,10 @@ On follow-up: if the user is not satisfied, ask them which pipeline to search. D
 		ctx = logger.NewContext(ctx, uuid.NewString(), "get_chunks_for_embeddings", username)
 		log := logger.FromContext(ctx)
 
-		if mp != nil {
-			var endTool func(bool)
-			ctx, endTool = mp.ToolObserver(ctx, "get_chunks_for_embeddings",
-				attribute.String("mcp.pipeline_name", args.PipelineName))
-			defer func() { endTool(res != nil && res.IsError) }()
-		}
+		var endTool func(cause string)
+		ctx, endTool = metricsProvider.ToolObserver(ctx, "get_chunks_for_embeddings",
+			attribute.String("mcp.pipeline_name", args.PipelineName))
+		defer func() { endTool(toolFailureCause(res)) }()
 
 		log.Info("tool invoked", "pipeline_name", args.PipelineName)
 
@@ -107,9 +108,7 @@ On follow-up: if the user is not satisfied, ask them which pipeline to search. D
 
 		k8sStart := time.Now()
 		qc, err := k8sClient.GetPipelineQueryConfig(ctx, args.PipelineName, operatorv1alpha1.StageTypeVectorEmbeddingsGenerator)
-		if mp != nil {
-			mp.RecordExternalCall(ctx, "k8s", "get_pipeline_query_config", time.Since(k8sStart), err)
-		}
+		metricsProvider.RecordExternalCall(ctx, "k8s", "get_pipeline_query_config", time.Since(k8sStart), err)
 		if err != nil {
 			log.Error("failed to get pipeline query config", "error", err)
 			return &mcp.CallToolResult{
@@ -129,9 +128,7 @@ On follow-up: if the user is not satisfied, ask them which pipeline to search. D
 		log.Info("generating embedding for query")
 		embStart := time.Now()
 		result, err := embeddingClient.GenerateEmbeddings(ctx, []string{args.Query}, "float")
-		if mp != nil {
-			mp.RecordExternalCall(ctx, "embedding", "generate", time.Since(embStart), err)
-		}
+		metricsProvider.RecordExternalCall(ctx, "embedding", "generate", time.Since(embStart), err)
 		if err != nil {
 			log.Error("failed to generate embedding", "error", err)
 			return &mcp.CallToolResult{
@@ -165,16 +162,12 @@ On follow-up: if the user is not satisfied, ask them which pipeline to search. D
 			log.Info("searching snowflake with file filter", "database", databaseName, "schema", schemaName, "table", tableName, "filePattern", filePattern, "limit", limit)
 			sfStart := time.Now()
 			chunks, err = snowflake.SearchChunksWithFileFilter(ctx, oauthToken, databaseName, schemaName, tableName, vectorLiteral, filePattern, limit)
-			if mp != nil {
-				mp.RecordExternalCall(ctx, "snowflake", "search_chunks_with_file_filter", time.Since(sfStart), err)
-			}
+			metricsProvider.RecordExternalCall(ctx, "snowflake", "search_chunks_with_file_filter", time.Since(sfStart), err)
 		} else {
 			log.Info("searching snowflake", "database", databaseName, "schema", schemaName, "table", tableName, "limit", limit)
 			sfStart := time.Now()
 			chunks, err = snowflake.SearchChunks(ctx, oauthToken, databaseName, schemaName, tableName, vectorLiteral, limit)
-			if mp != nil {
-				mp.RecordExternalCall(ctx, "snowflake", "search_chunks", time.Since(sfStart), err)
-			}
+			metricsProvider.RecordExternalCall(ctx, "snowflake", "search_chunks", time.Since(sfStart), err)
 		}
 		if err != nil {
 			log.Error("failed to search chunks in snowflake", "error", err, "database", databaseName, "schema", schemaName, "table", tableName)

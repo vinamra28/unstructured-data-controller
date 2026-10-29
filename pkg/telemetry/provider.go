@@ -16,13 +16,14 @@ limitations under the License.
 
 // Package metrics provides OpenTelemetry SDK initialization with dual export:
 // OTLP push (for collectors like Datadog/Langfuse) and Prometheus pull (for OSS scraping).
-package metrics
+package telemetry
 
 import (
 	"context"
 	"errors"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -38,6 +39,10 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.41.0"
 )
 
+// cleanupTimeout bounds best-effort shutdown of partially-initialized providers.
+// Without it, a hung OTLP exporter could stall Init's error return indefinitely.
+const cleanupTimeout = 5 * time.Second
+
 // Config holds configuration for the telemetry provider.
 type Config struct {
 	// ServiceName identifies this service in telemetry backends (e.g. "unstructured-data-controller").
@@ -51,14 +56,23 @@ type Config struct {
 	// existing /metrics endpoint alongside its built-in metrics.
 	// When nil (MCP server case), a new registry is created and served via PrometheusHandler().
 	PrometheusRegisterer prometheus.Registerer
+
+	// TraceSampleRatio is the fraction of traces exported, between 0 and 1.
+	// Zero means "use the SDK default of 1.0". High-throughput callers such as
+	// the controller should lower this so continuous reconcile loops do not
+	// overwhelm the collector. OTEL_TRACES_SAMPLER_ARG overrides this at runtime.
+	TraceSampleRatio float64
 }
 
 // Provider manages OTel MeterProvider and TracerProvider lifecycle.
 // It supports dual export: Prometheus (always on) and OTLP gRPC (when OTEL_EXPORTER_OTLP_ENDPOINT is set).
+//
+// All recording methods are safe to call on a nil Provider, so callers holding
+// an optional Provider do not need nil guards at every recording site.
 type Provider struct {
 	meterProvider  *sdkmetric.MeterProvider
 	tracerProvider *sdktrace.TracerProvider
-	Instruments    *Instruments
+	instruments    *instruments
 
 	// promGatherer is set only when PrometheusRegisterer was nil (MCP server case),
 	// so PrometheusHandler() can serve the metrics.
@@ -68,7 +82,7 @@ type Provider struct {
 // Init creates and configures OTel providers with dual export.
 // Prometheus export is always active. OTLP push activates when OTEL_EXPORTER_OTLP_ENDPOINT
 // is set - the SDK reads that env var automatically, so no manual endpoint parsing is needed.
-func Init(ctx context.Context, cfg Config) (*Provider, error) {
+func Init(ctx context.Context, cfg Config) (_ *Provider, retErr error) {
 	res, err := resource.New(ctx,
 		resource.WithAttributes(
 			semconv.ServiceName(cfg.ServiceName),
@@ -97,27 +111,29 @@ func Init(ctx context.Context, cfg Config) (*Provider, error) {
 	p.meterProvider = sdkmetric.NewMeterProvider(mpOpts...)
 
 	// If later steps fail, shut down the MeterProvider to stop its background
-	// periodic reader. The deferred cleanup is cancelled on success.
+	// periodic reader. Cleanup is best effort: its error is joined onto the
+	// initialization error rather than replacing it. Cancelled on success.
 	meterProviderReady := false
 	defer func() {
 		if !meterProviderReady {
-			_ = p.meterProvider.Shutdown(context.Background())
+			if cleanupErr := shutdownBounded(p.meterProvider.Shutdown); cleanupErr != nil {
+				retErr = errors.Join(retErr, cleanupErr)
+			}
 		}
 	}()
 
-	tp, err := setupTracerProvider(ctx, res)
+	tp, err := setupTracerProvider(ctx, res, cfg)
 	if err != nil {
 		return nil, err
 	}
 	p.tracerProvider = tp
 
-	instruments, err := newInstruments(p.meterProvider)
+	inst, err := newInstruments(p.meterProvider)
 	if err != nil {
 		// Clean up the TracerProvider we just created.
-		_ = tp.Shutdown(context.Background())
-		return nil, err
+		return nil, errors.Join(err, shutdownBounded(tp.Shutdown))
 	}
-	p.Instruments = instruments
+	p.instruments = inst
 
 	// Set globals only after all components are ready, so a partial failure
 	// never leaves the process with half-initialized global providers.
@@ -126,6 +142,14 @@ func Init(ctx context.Context, cfg Config) (*Provider, error) {
 
 	meterProviderReady = true
 	return p, nil
+}
+
+// shutdownBounded runs a provider shutdown under cleanupTimeout so a hung
+// exporter cannot block the caller indefinitely.
+func shutdownBounded(shutdown func(context.Context) error) error {
+	ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+	defer cancel()
+	return shutdown(ctx)
 }
 
 // setupMetricReaders creates the Prometheus reader (always) and optional OTLP periodic reader.
@@ -173,8 +197,13 @@ func (p *Provider) setupPrometheusReader(cfg Config) (sdkmetric.Reader, error) {
 // setupTracerProvider creates a TracerProvider with optional OTLP export.
 // When OTEL_EXPORTER_OTLP_ENDPOINT is not set, the provider is created without
 // an exporter - traces are no-ops (zero overhead, no data sent).
-func setupTracerProvider(ctx context.Context, res *resource.Resource) (*sdktrace.TracerProvider, error) {
-	tpOpts := []sdktrace.TracerProviderOption{sdktrace.WithResource(res)}
+func setupTracerProvider(
+	ctx context.Context, res *resource.Resource, cfg Config,
+) (*sdktrace.TracerProvider, error) {
+	tpOpts := []sdktrace.TracerProviderOption{
+		sdktrace.WithResource(res),
+		sdktrace.WithSampler(traceSampler(cfg.TraceSampleRatio)),
+	}
 
 	if os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT") != "" {
 		traceExporter, err := otlptracegrpc.New(ctx)
@@ -185,6 +214,26 @@ func setupTracerProvider(ctx context.Context, res *resource.Resource) (*sdktrace
 	}
 
 	return sdktrace.NewTracerProvider(tpOpts...), nil
+}
+
+// traceSampler builds an explicit sampler. The SDK default is AlwaysSample,
+// which exports 100% of traces - too much for a controller running continuous
+// reconcile loops. Callers set their own ratio via Config.TraceSampleRatio and
+// operators override it at runtime with OTEL_TRACES_SAMPLER_ARG.
+//
+// ParentBased keeps a distributed trace intact: when an upstream service has
+// already made a sampling decision, child spans here honour it rather than
+// re-rolling and producing partial traces.
+func traceSampler(ratio float64) sdktrace.Sampler {
+	if ratio <= 0 || ratio > 1 {
+		ratio = 1.0
+	}
+	if v := os.Getenv("OTEL_TRACES_SAMPLER_ARG"); v != "" {
+		if parsed, err := strconv.ParseFloat(v, 64); err == nil && parsed >= 0 && parsed <= 1 {
+			ratio = parsed
+		}
+	}
+	return sdktrace.ParentBased(sdktrace.TraceIDRatioBased(ratio))
 }
 
 // PrometheusHandler returns an http.Handler serving Prometheus metrics.

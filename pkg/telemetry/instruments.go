@@ -14,10 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package metrics
+package telemetry
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -29,8 +30,17 @@ import (
 
 const meterName = "udc"
 
-// Instruments holds pre-registered OTel metric instruments for the controller and MCP server.
-type Instruments struct {
+// instruments holds pre-registered OTel metric instruments for the controller
+// and MCP server.
+//
+// The reconcile instruments deliberately duplicate controller-runtime's
+// built-in controller_runtime_reconcile_{total,time_seconds,errors_total}.
+// Those built-ins are registered on controller-runtime's Prometheus registry
+// and are therefore scrape-only: they never reach an OTLP collector. These
+// OTel equivalents are what Datadog and Langfuse receive over OTLP. When
+// alerting off the Prometheus endpoint prefer the controller_runtime_* series;
+// when alerting in Datadog use these.
+type instruments struct {
 	// Controller reconcile metrics
 	reconcileCount    metric.Int64Counter
 	reconcileDuration metric.Float64Histogram
@@ -50,9 +60,9 @@ var durationBuckets = []float64{
 	0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300,
 }
 
-func newInstruments(mp metric.MeterProvider) (*Instruments, error) {
+func newInstruments(mp metric.MeterProvider) (*instruments, error) {
 	meter := mp.Meter(meterName)
-	var inst Instruments
+	var inst instruments
 	var err error
 
 	bucketOpt := metric.WithExplicitBucketBoundaries(durationBuckets...)
@@ -129,23 +139,30 @@ func newInstruments(mp metric.MeterProvider) (*Instruments, error) {
 //	    obs := metricsProvider.ReconcileObserver("MyController")
 //	    defer obs.End(ctx, &retErr)
 type ReconcileObserver struct {
-	instruments    *Instruments
+	instruments    *instruments
 	controllerName string
 	start          time.Time
 }
 
 // ReconcileObserver returns an observer that tracks reconcile duration and outcome.
+// Safe to call on a nil Provider; the returned observer is then a no-op.
 func (p *Provider) ReconcileObserver(controllerName string) *ReconcileObserver {
+	if p == nil {
+		return &ReconcileObserver{}
+	}
 	return &ReconcileObserver{
-		instruments:    p.Instruments,
+		instruments:    p.instruments,
 		controllerName: controllerName,
 		start:          time.Now(),
 	}
 }
 
 // End records reconcile count, duration, and error metrics.
-// Pass pointers to the named return values so the deferred call captures the final values.
+// Pass a pointer to the named error return so the deferred call sees the final value.
 func (o *ReconcileObserver) End(ctx context.Context, retErr *error) {
+	if o == nil || o.instruments == nil {
+		return
+	}
 	attrs := metric.WithAttributes(
 		attribute.String("controller", o.controllerName),
 	)
@@ -159,19 +176,33 @@ func (o *ReconcileObserver) End(ctx context.Context, retErr *error) {
 }
 
 // RecordFilesProcessed increments the files-processed counter for a controller.
+// Safe to call on a nil Provider.
 func (p *Provider) RecordFilesProcessed(ctx context.Context, controllerName string, count int64) {
-	p.Instruments.filesProcessed.Add(ctx, count,
+	if p == nil {
+		return
+	}
+	p.instruments.filesProcessed.Add(ctx, count,
 		metric.WithAttributes(attribute.String("controller", controllerName)))
 }
 
 // ToolObserver starts a trace span and returns a finish function that records tool metrics.
 // The returned context carries the span for propagation to child spans in pkg/ packages.
+// Safe to call on a nil Provider; the context is returned unchanged and the
+// finish function is a no-op.
+//
+// The finish function takes the failure cause so the span carries a reason.
+// Pass an empty string on success. Callers that only have an error result
+// without a machine-readable error should pass the user-facing message.
 //
 //	ctx, endTool := metricsProvider.ToolObserver(ctx, "get_chunks_for_embeddings")
-//	defer func() { endTool(hasError) }()
+//	defer func() { endTool(toolFailureCause(res)) }()
 func (p *Provider) ToolObserver(
 	ctx context.Context, toolName string, spanAttrs ...attribute.KeyValue,
-) (context.Context, func(isError bool)) {
+) (context.Context, func(cause string)) {
+	if p == nil {
+		return ctx, func(string) {}
+	}
+
 	tracer := otel.Tracer(meterName)
 	allAttrs := append([]attribute.KeyValue{attribute.String("mcp.tool.name", toolName)}, spanAttrs...)
 	ctx, span := tracer.Start(ctx, "mcp.tool/"+toolName,
@@ -181,14 +212,16 @@ func (p *Provider) ToolObserver(
 	start := time.Now()
 	toolAttr := metric.WithAttributes(attribute.String("tool", toolName))
 
-	return ctx, func(isError bool) {
+	return ctx, func(cause string) {
 		elapsed := time.Since(start).Seconds()
 
-		p.Instruments.toolCallCount.Add(ctx, 1, toolAttr)
-		p.Instruments.toolCallDuration.Record(ctx, elapsed, toolAttr)
-		if isError {
-			p.Instruments.toolCallErrors.Add(ctx, 1, toolAttr)
-			span.SetStatus(codes.Error, "tool call failed")
+		p.instruments.toolCallCount.Add(ctx, 1, toolAttr)
+		p.instruments.toolCallDuration.Record(ctx, elapsed, toolAttr)
+		if cause != "" {
+			safeCause := sanitize(cause)
+			p.instruments.toolCallErrors.Add(ctx, 1, toolAttr)
+			span.RecordError(errors.New(safeCause))
+			span.SetStatus(codes.Error, safeCause)
 		}
 		span.End()
 	}
@@ -197,18 +230,26 @@ func (p *Provider) ToolObserver(
 // RecordExternalCall records the duration of an external service call and, on error,
 // marks the current span with the error. Used in MCP tool handlers to time
 // calls to K8s, Snowflake, and embedding services.
+// Safe to call on a nil Provider.
 func (p *Provider) RecordExternalCall(
 	ctx context.Context, service, operation string, duration time.Duration, err error,
 ) {
+	if p == nil {
+		return
+	}
 	attrs := metric.WithAttributes(
 		attribute.String("service", service),
 		attribute.String("operation", operation),
 	)
-	p.Instruments.externalCallDuration.Record(ctx, duration.Seconds(), attrs)
+	p.instruments.externalCallDuration.Record(ctx, duration.Seconds(), attrs)
 
-	if err != nil {
-		span := trace.SpanFromContext(ctx)
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
+	if err == nil {
+		return
 	}
+	// Downstream errors can embed connection strings, SQL text, or tokens.
+	// Sanitize before the message leaves the process for Datadog/Langfuse.
+	safeMsg := sanitize(err.Error())
+	span := trace.SpanFromContext(ctx)
+	span.RecordError(errors.New(safeMsg))
+	span.SetStatus(codes.Error, safeMsg)
 }

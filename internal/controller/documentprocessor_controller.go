@@ -27,6 +27,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -39,6 +40,7 @@ import (
 	"github.com/redhat-data-and-ai/unstructured-data-controller/internal/controller/controllerutils"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/docling"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/filestore"
+	udctelemetry "github.com/redhat-data-and-ai/unstructured-data-controller/pkg/telemetry"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/unstructured"
 )
 
@@ -54,7 +56,9 @@ var (
 // DocumentProcessorReconciler reconciles a DocumentProcessor object
 type DocumentProcessorReconciler struct {
 	client.Client
-	Scheme    *runtime.Scheme
+	Scheme *runtime.Scheme
+	// Metrics records reconcile telemetry. Nil disables recording.
+	Metrics   *udctelemetry.Provider
 	fileStore *filestore.FileStore
 }
 
@@ -63,10 +67,7 @@ type DocumentProcessorReconciler struct {
 // +kubebuilder:rbac:groups=operator.dataverse.redhat.com,namespace=unstructured-controller-namespace,resources=documentprocessors/finalizers,verbs=update
 
 func (r *DocumentProcessorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, retErr error) {
-	if metricsProvider != nil {
-		obs := metricsProvider.ReconcileObserver(DocumentProcessorControllerName)
-		defer obs.End(ctx, &retErr)
-	}
+	defer r.Metrics.ReconcileObserver(DocumentProcessorControllerName).End(ctx, &retErr)
 	logger := log.FromContext(ctx)
 	logger.Info("reconciling", "controller", DocumentProcessorControllerName)
 
@@ -278,9 +279,7 @@ func (r *DocumentProcessorReconciler) reconcileJob(ctx context.Context, job oper
 			logger.Error(updateErr, "failed to delete job from status as it has completed successfully", "filePath", job.FilePath)
 			return updateErr
 		}
-		if metricsProvider != nil {
-			metricsProvider.RecordFilesProcessed(ctx, DocumentProcessorControllerName, 1)
-		}
+		r.Metrics.RecordFilesProcessed(ctx, DocumentProcessorControllerName, 1)
 		logger.Info("successfully removed job from status as it has completed successfully", "filePath", job.FilePath)
 
 	case docling.TaskStatusFailure, docling.TaskStatusSkipped:

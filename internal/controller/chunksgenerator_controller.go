@@ -25,6 +25,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -37,6 +38,7 @@ import (
 	"github.com/redhat-data-and-ai/unstructured-data-controller/internal/controller/controllerutils"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/filestore"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/langchain"
+	udctelemetry "github.com/redhat-data-and-ai/unstructured-data-controller/pkg/telemetry"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/unstructured"
 	"github.com/tmc/langchaingo/textsplitter"
 )
@@ -48,7 +50,9 @@ const (
 // ChunksGeneratorReconciler reconciles a ChunksGenerator object
 type ChunksGeneratorReconciler struct {
 	client.Client
-	Scheme    *runtime.Scheme
+	Scheme *runtime.Scheme
+	// Metrics records reconcile telemetry. Nil disables recording.
+	Metrics   *udctelemetry.Provider
 	fileStore *filestore.FileStore
 }
 
@@ -66,10 +70,7 @@ type ChunksGeneratorReconciler struct {
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.21.0/pkg/reconcile
 func (r *ChunksGeneratorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, retErr error) {
-	if metricsProvider != nil {
-		obs := metricsProvider.ReconcileObserver(ChunksGeneratorControllerName)
-		defer obs.End(ctx, &retErr)
-	}
+	defer r.Metrics.ReconcileObserver(ChunksGeneratorControllerName).End(ctx, &retErr)
 	logger := log.FromContext(ctx)
 	logger.Info("reconciling", "controller", ChunksGeneratorControllerName)
 
@@ -171,9 +172,7 @@ func (r *ChunksGeneratorReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return r.handleError(ctx, chunksGeneratorCR, err)
 	}
 	// Record after the patch succeeds to avoid inflating the counter on retries.
-	if metricsProvider != nil {
-		metricsProvider.RecordFilesProcessed(ctx, ChunksGeneratorControllerName, filesProcessed)
-	}
+	r.Metrics.RecordFilesProcessed(ctx, ChunksGeneratorControllerName, filesProcessed)
 	logger.Info("successfully updated ChunksGenerator CR status", "status", chunksGeneratorCR.Status)
 
 	return ctrl.Result{}, nil
