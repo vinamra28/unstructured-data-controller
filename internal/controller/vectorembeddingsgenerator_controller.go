@@ -135,9 +135,13 @@ func (r *VectorEmbeddingsGeneratorReconciler) Reconcile(ctx context.Context, req
 		}
 	}
 
+	// Files embedded before the failure are counted here because the status
+	// patch below is skipped: needsEmbedding returns false for them on the
+	// next attempt, so the count would be lost rather than deferred.
 	if len(embeddingErrors) > 0 {
-		logger.Error(embeddingErrors[0], "failed to process some chunked files")
-		return r.handleError(ctx, vectorEmbeddingsGeneratorCR, errors.New("failed to process some chunked files"))
+		r.recordPartialProgress(ctx, vectorEmbeddingsGeneratorCR, filesProcessed)
+		return r.handleError(ctx, vectorEmbeddingsGeneratorCR,
+			fmt.Errorf("processing chunked files: %w", embeddingErrors[0]))
 	}
 
 	// all done, let's update the status to ready
@@ -401,6 +405,28 @@ func (r *VectorEmbeddingsGeneratorReconciler) findDependents(ctx context.Context
 }
 
 // SetupWithManager sets up the controller with the Manager.
+// recordPartialProgress persists a count from a reconcile that is about to
+// return early and records the metric, but only once the patch has landed so
+// a retry after a failed patch cannot double-count.
+//
+// A patch failure is logged rather than returned: the caller is already
+// leaving with the error that caused the early return.
+func (r *VectorEmbeddingsGeneratorReconciler) recordPartialProgress(
+	ctx context.Context, vectorEmbeddingsGeneratorCR *operatorv1alpha1.VectorEmbeddingsGenerator, count int64,
+) {
+	if count == 0 {
+		return
+	}
+	logger := log.FromContext(ctx)
+	if err := controllerutils.StatusPatch(ctx, r.Client, vectorEmbeddingsGeneratorCR, func() {
+		vectorEmbeddingsGeneratorCR.Status.FilesProcessed += count
+	}); err != nil {
+		logger.Error(err, "failed to persist partial embedded file count", "count", count)
+		return
+	}
+	r.Metrics.RecordFilesProcessed(ctx, VectorEmbeddingsGeneratorControllerName, count)
+}
+
 func (r *VectorEmbeddingsGeneratorReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&operatorv1alpha1.VectorEmbeddingsGenerator{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).

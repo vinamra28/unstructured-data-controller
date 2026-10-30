@@ -469,6 +469,8 @@ func TestSanitizeCorpus(t *testing.T) {
 		{"image reference with a digest", `failed to pull image quay.io/redhat/udc:v1.2.0@sha256:deadbeef`},
 		{"pod reference with a node", `Pod default:web-0@node-1 evicted`},
 		{"git ref with a remote", `ref refs/heads/main:deploy@origin`},
+		{"email in a query string", `GET http://host:8080?email=foo@bar.com failed`},
+		{"at sign in a fragment", `https://api.example.com/v1#frag@notuser`},
 	}
 
 	for _, testCase := range intact {

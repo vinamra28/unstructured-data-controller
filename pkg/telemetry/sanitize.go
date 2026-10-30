@@ -69,11 +69,16 @@ var secretRules = []struct {
 		// containing one - failing open on exactly the generated passwords
 		// most likely to contain them. '@' is allowed because a password may
 		// contain one; greedy matching runs to the last '@' of the userinfo,
-		// and '/' and whitespace still bound the match so a bare email
-		// address later in the message is untouched.
+		// and '/', '?', '#' and whitespace bound the match so a bare email
+		// address later in the message is untouched. RFC 3986 requires '?'
+		// and '#' to be percent-encoded inside userinfo, so excluding them
+		// cannot drop a real credential - but leaving them in lets an '@' in
+		// a query string read as the end of userinfo, turning
+		// http://host:8080?email=foo@bar.com into http://[REDACTED]@bar.com
+		// and losing the host the message existed to report.
 		//
 		// The scheme is kept so the host context survives.
-		pattern:     regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://)[^/\s]*:[^/\s]*@`),
+		pattern:     regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://)[^/\s?#]*:[^/\s?#]*@`),
 		replacement: "${1}" + redacted + "@",
 	},
 	{

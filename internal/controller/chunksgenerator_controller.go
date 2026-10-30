@@ -150,13 +150,18 @@ func (r *ChunksGeneratorReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		logger.Info("successfully processed converted file", "file", convertedFilePath)
 	}
 
+	// Both early returns below skip the status patch, so files chunked
+	// before the failure have to be counted here or they are counted
+	// nowhere: needsChunking returns false for them next time round, so the
+	// count is lost permanently rather than deferred.
 	if len(chunkingErrors) > 0 {
-		err := fmt.Errorf("failed to chunk some files: %v", chunkingErrors)
-		logger.Error(err, "chunking error")
-		return r.handleError(ctx, chunksGeneratorCR, err)
+		r.recordPartialProgress(ctx, chunksGeneratorCR, filesProcessed)
+		return r.handleError(ctx, chunksGeneratorCR,
+			fmt.Errorf("chunking files: %v", chunkingErrors))
 	}
 
 	if len(skippedFiles) > 0 {
+		r.recordPartialProgress(ctx, chunksGeneratorCR, filesProcessed)
 		logger.Info("some files were skipped, will requeue after a bit ...")
 		return ctrl.Result{
 			RequeueAfter: requeueAfter,
@@ -373,6 +378,29 @@ func (r *ChunksGeneratorReconciler) findDependents(ctx context.Context, obj clie
 }
 
 // SetupWithManager sets up the controller with the Manager.
+// recordPartialProgress persists a count from a reconcile that is about to
+// return early and records the metric, but only once the patch has landed so
+// a retry after a failed patch cannot double-count.
+//
+// A patch failure is logged rather than returned: the caller is already
+// leaving with the error that caused the early return, which is the more
+// useful one to surface.
+func (r *ChunksGeneratorReconciler) recordPartialProgress(
+	ctx context.Context, chunksGeneratorCR *operatorv1alpha1.ChunksGenerator, count int64,
+) {
+	if count == 0 {
+		return
+	}
+	logger := log.FromContext(ctx)
+	if err := controllerutils.StatusPatch(ctx, r.Client, chunksGeneratorCR, func() {
+		chunksGeneratorCR.Status.FilesProcessed += count
+	}); err != nil {
+		logger.Error(err, "failed to persist partial chunked file count", "count", count)
+		return
+	}
+	r.Metrics.RecordFilesProcessed(ctx, ChunksGeneratorControllerName, count)
+}
+
 func (r *ChunksGeneratorReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&operatorv1alpha1.ChunksGenerator{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).

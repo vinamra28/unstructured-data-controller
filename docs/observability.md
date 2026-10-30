@@ -199,10 +199,19 @@ succeeds, so a failed patch followed by a retry does not double-count:
 if err := controllerutils.StatusPatch(ctx, r.Client, cr, func() {
     cr.Status.FilesProcessed += count
 }); err != nil {
-    return r.handleError(ctx, cr, err)
+    // Returned with context, not logged first: controller-runtime logs a
+    // returned reconcile error, so doing both duplicates it. The existing
+    // handleError does log-and-return; CLAUDE.md names that as a deviation
+    // new code should not copy.
+    return ctrl.Result{}, fmt.Errorf("updating %s status: %w", MyControllerName, err)
 }
 r.Metrics.RecordFilesProcessed(ctx, MyControllerName, count)
 ```
+
+Record partial counts on early-return paths too. A reconcile that processes
+some files and then fails still did that work, and the next attempt skips
+those files as already done, so a count taken only on full success is lost
+permanently rather than deferred.
 
 Wire the provider in `cmd/main.go` when constructing the reconciler. The
 recording methods tolerate a nil `Provider`, so no nil guards are needed at
