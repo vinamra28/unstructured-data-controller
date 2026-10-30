@@ -32,6 +32,12 @@ import (
 // beyond the first line.
 const maxMessageLen = 256
 
+// maxSanitizeInput caps how much text the redaction rules will scan. Well
+// above maxMessageLen so that a credential near the start still has its
+// terminator in range, and far enough below "unbounded" that a hostile input
+// cannot turn three regex passes into a denial of service.
+const maxSanitizeInput = 8 << 10
+
 const redacted = "[REDACTED]"
 
 // secretRules match credential material that downstream clients commonly
@@ -50,41 +56,93 @@ var secretRules = []struct {
 	{
 		// Credentials in a URL userinfo section: scheme://user:password@host
 		//
-		// Both userinfo parts use [^/\s]* rather than excluding '@'. A password
-		// may itself contain '@', and stopping at the first one would leave the
-		// remainder of the password in the message. Greedy matching consumes
-		// through the last '@' of the userinfo; '/' and whitespace still bound
-		// the match so a later unrelated '@' (an email address, say) is safe.
+		// The scheme is REQUIRED. Making it optional turns this into "any
+		// whitespace-free word:word@ run" and destroys ordinary identifiers:
+		// an image ref (quay.io/org/app:v1@sha256:...), a pod reference
+		// (default:web-0@node-1) and a compact JSON body containing a service
+		// account address all match. Scheme-less DSNs are handled by the next
+		// rule, which is narrow enough to tell them apart.
+		//
+		// Both userinfo halves are deliberately permissive ([^/\s]*). Nothing
+		// constrains what a Secret holds, so excluding quotes, commas or
+		// braces to tidy up a match would simply stop redacting any password
+		// containing one - failing open on exactly the generated passwords
+		// most likely to contain them. '@' is allowed because a password may
+		// contain one; greedy matching runs to the last '@' of the userinfo,
+		// and '/' and whitespace still bound the match so a bare email
+		// address later in the message is untouched.
 		//
 		// The scheme is kept so the host context survives.
 		pattern:     regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://)[^/\s]*:[^/\s]*@`),
 		replacement: "${1}" + redacted + "@",
 	},
 	{
+		// Scheme-less DSN userinfo: user:password@account/database/schema,
+		// which is the form Snowflake connection strings take.
+		//
+		// Kept narrow precisely because there is no scheme to anchor on: the
+		// password may not contain '@' or '/', and the host must be followed
+		// by '/'. That trailing slash is what separates a DSN from an image
+		// digest (app:v1@sha256:abc) or a pod reference (ns:pod@node), which
+		// have no path after the host.
+		pattern:     regexp.MustCompile(`\b[\w.-]+:[^\s@/]+@([\w.-]+/)`),
+		replacement: redacted + "@${1}",
+	},
+	{
 		// Authorization header values: "Bearer abc123", "Basic dXNlcjpwYXNz".
-		// The scheme word is kept: it says which auth scheme was rejected and
-		// is not itself secret.
+		//
+		// Everything after the scheme word is redacted unconditionally. An
+		// earlier version tried to tell a credential from an English word by
+		// shape, so that "basic authentication is not enabled" kept its text.
+		// Every such test has the same failure mode: a short, all-lowercase
+		// opaque token, or unpadded base64 of a lowercase "user:pass", looks
+		// exactly like a word and ships in clear. A lost word is a reporting
+		// problem; a leaked token is a security one, so this errs toward
+		// redacting.
+		//
+		// Known over-redaction: prose such as "bearer token has expired" and
+		// "Basic Auth required" loses the word after the keyword. The scheme
+		// word itself is kept, which usually leaves enough to recognise the
+		// failure.
 		pattern:     regexp.MustCompile(`(?i)\b(bearer|basic)\s+[A-Za-z0-9\-._~+/=]+`),
 		replacement: "${1} " + redacted,
 	},
 	{
-		// key=value and key: value pairs for sensitive key names. The optional
-		// quote after the key name covers JSON bodies ("api_key": "...") as well
-		// as bare connection-string and query-parameter forms (password=...).
+		// key=value and key: value pairs for sensitive key names.
 		//
-		// The [\w.-]* prefix is what catches the compound names that actually
-		// appear in OAuth, SSO and AWS error bodies: access_token,
-		// client_secret, refresh_token, aws_secret_access_key, x-api-key. A
-		// plain \b before the alternation cannot match any of them, because
-		// '_' is a word character so there is no boundary before "token" in
-		// "access_token". The prefix is inside group 1 so the full key name
-		// survives redaction.
+		// \b is the left boundary rather than an explicit delimiter class.
+		// Enumerating delimiters looks tidier but silently drops whatever the
+		// list forgets, and the omissions bite hardest: ';' carries
+		// ODBC/JDBC/libpq connection strings and '(' the parenthesised
+		// contexts Go errors favour, both of which are prime credential
+		// shapes. \b admits them all.
+		//
+		// The [\w.-]* prefix catches compound names that appear in OAuth, SSO
+		// and AWS bodies - access_token, client_secret, aws_secret_access_key,
+		// x-api-key, X-Amz-Signature. A bare \b before the alternation matches
+		// none of them, because '_' is a word character so there is no
+		// boundary before "token" in "access_token". The prefix sits inside
+		// group 1 so the whole key name survives redaction.
+		//
+		// [_ \t-]? covers the spaced forms vendors use in prose ("API key"),
+		// and the optional connector word catches "Incorrect API key
+		// provided: sk-..." - the shape OpenAI-compatible servers return in a
+		// 401 body. The separator uses \s* rather than horizontal space only,
+		// so a pretty-printed JSON body with the value on the next line is
+		// still covered.
+		//
+		// Known over-redaction: a message of the form "<key name>: <prose>"
+		// loses its first word, as in "cannot fetch token: 401 Unauthorized",
+		// and a URL path segment ending in a key name reads as a key. Both
+		// follow from preferring redaction when the shape is ambiguous.
 		//
 		// The key name and separator are kept so a reader can tell which
 		// credential the message was carrying; only the value is replaced.
 		pattern: regexp.MustCompile(
-			`(?i)\b([\w.-]*(?:password|passwd|token|secret|api[_-]?key|access[_-]?key|private[_-]?key|credential))` +
-				`("?\s*[=:]\s*)("[^"]*"|'[^']*'|[^\s,;&)}]+)`),
+			`(?i)\b([\w.-]*(?:password|passwd|token|secret|signature|api[_ \t-]?key` +
+				`|access[_ \t-]?key|private[_ \t-]?key|credential))` +
+				`((?:[ \t]+(?:provided|supplied|given|specified|used|value))?"?\s*[=:]\s*)` +
+				`("[^"]*"|'[^']*'|[^\s,;&)}]+)`),
 		replacement: "${1}${2}" + redacted,
 	},
 }
@@ -105,6 +163,23 @@ const replacementChar = string(utf8.RuneError)
 // sanitize strips credential material from a message and truncates it so error
 // text recorded on spans cannot leak secrets to telemetry backends.
 func sanitize(msg string) string {
+	// Bound the work before doing any of it. The rules below run over the
+	// whole string, so an unbounded input lets whoever controls it spend
+	// server CPU proportional to its length - reachable from MCP tool
+	// arguments and from downstream response bodies. Cutting here rather
+	// than at the call sites keeps the guarantee in one place.
+	//
+	// The cut is far above maxMessageLen, so it cannot orphan the right-hand
+	// terminator of a credential that would otherwise have been redacted
+	// inside the part that survives truncation.
+	if len(msg) > maxSanitizeInput {
+		limit := maxSanitizeInput
+		for limit > 0 && !utf8.RuneStart(msg[limit]) {
+			limit--
+		}
+		msg = msg[:limit]
+	}
+
 	// Normalize before anything else. Truncating on a rune boundary is not
 	// enough on its own: a downstream error can carry invalid bytes anywhere
 	// in the message, including in messages short enough never to be
@@ -132,6 +207,23 @@ func sanitize(msg string) string {
 		return msg[:limit] + "...[truncated]"
 	}
 	return msg
+}
+
+// SafeAttributeValue prepares an untrusted string for use as a span
+// attribute: credential material is redacted, invalid UTF-8 is normalized,
+// and the result is capped at maxMessageLen.
+//
+// Span attributes have no length limit in the SDK by default, so anything
+// derived from client input has to be bounded before it is recorded.
+//
+// Note that redaction must happen before truncation, not after: two of the
+// three rules need a right-hand terminator, so cutting first can remove the
+// '@' or the closing quote that made a secret matchable and leave a prefix of
+// it in the result. sanitize bounds its own input, so doing it in this order
+// costs nothing.
+
+func SafeAttributeValue(value string) string {
+	return sanitize(value)
 }
 
 // RecordSpanError marks span as failed with a sanitized form of err.

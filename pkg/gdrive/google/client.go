@@ -80,6 +80,13 @@ func NewClient(
 	opts := []option.ClientOption{
 		option.WithAuthCredentialsFile(option.ServiceAccount, credentialsFile),
 		option.WithScopes(drive.DriveReadonlyScope),
+		// WithTelemetryDisabled keeps this client's HTTP instrumentation off
+		// the operator's meter. pkg/telemetry installs a global MeterProvider,
+		// and google.golang.org/api wraps its transport in otelhttp, which
+		// resolves that global at construction - so without this the binary
+		// silently exports http.client.* series, one set per host x method x
+		// status code, alongside the udc_* metrics this project defines.
+		option.WithTelemetryDisabled(),
 	}
 
 	driveService, err := drive.NewService(ctx, opts...)
@@ -93,6 +100,7 @@ func NewClient(
 		option.WithAuthCredentialsFile(option.ServiceAccount, credentialsFile),
 		option.WithScopes(
 			cloudidentity.CloudIdentityGroupsReadonlyScope),
+		option.WithTelemetryDisabled(),
 	)
 	if err != nil {
 		return nil, fmt.Errorf(
@@ -124,6 +132,13 @@ func NewClientFromJSON(
 	opts := []option.ClientOption{
 		option.WithAuthCredentialsJSON(option.ServiceAccount, credentialsJSON),
 		option.WithScopes(drive.DriveReadonlyScope),
+		// WithTelemetryDisabled keeps this client's HTTP instrumentation off
+		// the operator's meter. pkg/telemetry installs a global MeterProvider,
+		// and google.golang.org/api wraps its transport in otelhttp, which
+		// resolves that global at construction - so without this the binary
+		// silently exports http.client.* series, one set per host x method x
+		// status code, alongside the udc_* metrics this project defines.
+		option.WithTelemetryDisabled(),
 	}
 
 	driveService, err := drive.NewService(ctx, opts...)
@@ -137,6 +152,7 @@ func NewClientFromJSON(
 		option.WithAuthCredentialsJSON(option.ServiceAccount, credentialsJSON),
 		option.WithScopes(
 			cloudidentity.CloudIdentityGroupsReadonlyScope),
+		option.WithTelemetryDisabled(),
 	)
 	if err != nil {
 		return nil, fmt.Errorf(

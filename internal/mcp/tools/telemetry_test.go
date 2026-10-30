@@ -35,6 +35,11 @@ import (
 func setupTestProvider(t *testing.T) (*udctelemetry.Provider, *prometheus.Registry) {
 	t.Helper()
 
+	// The tool allow-list is populated by registration, so every test that
+	// records under a real tool name needs it populated first. Doing it here
+	// keeps the tests order-independent under -shuffle.
+	withRegisteredTools(t)
+
 	// Keep the OTLP exporter out of the test: it would try to dial a collector.
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
 
@@ -74,6 +79,16 @@ func counterValue(t *testing.T, registry *prometheus.Registry, nameFragment, too
 		}
 	}
 	return -1
+}
+
+// withRegisteredTools populates the allow-list the way main.go does, so tests
+// that depend on it do not depend on another test having run first.
+func withRegisteredTools(t *testing.T) {
+	t.Helper()
+	server := mcp.NewServer(&mcp.Implementation{Name: "test", Version: "0"}, nil)
+	RegisterListPipelines(server, nil, nil)
+	RegisterGetChunksForEmbeddings(server, nil, nil, nil)
+	RegisterGetProcessedDocument(server, nil, nil)
 }
 
 func toolCallRequest(toolName string) *mcp.CallToolRequest {
@@ -125,6 +140,8 @@ func TestTelemetryMiddlewareBoundsUnknownToolNames(t *testing.T) {
 }
 
 func TestToolNameAllowList(t *testing.T) {
+	withRegisteredTools(t)
+
 	// Registered names pass through unchanged so dashboards stay meaningful.
 	for _, name := range []string{ToolListPipelines, ToolGetChunks, ToolGetProcessedDocument} {
 		assert.Equal(t, name, toolName(name))
@@ -136,19 +153,29 @@ func TestToolNameAllowList(t *testing.T) {
 	}
 }
 
-// The allow-list is maintained by hand, so this fails if a tool is registered
-// without being added to it.
-func TestRegisteredToolsCoversEveryRegisteredName(t *testing.T) {
-	server := mcp.NewServer(&mcp.Implementation{Name: "test", Version: "0"}, nil)
-	RegisterListPipelines(server, nil, nil)
-	RegisterGetChunksForEmbeddings(server, nil, nil, nil)
-	RegisterGetProcessedDocument(server, nil, nil)
+// Registration is what populates the allow-list, so this asserts the real
+// set rather than a hardcoded count: every name the Register* functions put
+// on a server must come back bounded to itself, and nothing else may.
+func TestRegisteredToolsComesFromRegistration(t *testing.T) {
+	withRegisteredTools(t)
 
+	registeredToolsMu.RLock()
+	got := make([]string, 0, len(registeredTools))
 	for name := range registeredTools {
+		got = append(got, name)
+	}
+	registeredToolsMu.RUnlock()
+
+	// Subset, not exact: registeredTools is a package global that other tests
+	// also populate and nothing resets. What matters is that registration put
+	// each name in, not that no other test added one.
+	assert.Subset(t, got,
+		[]string{ToolListPipelines, ToolGetChunks, ToolGetProcessedDocument},
+		"registering a tool must record its own name")
+
+	for _, name := range got {
 		assert.Equal(t, name, toolName(name))
 	}
-	assert.Len(t, registeredTools, 3,
-		"a newly registered tool must also be added to registeredTools")
 }
 
 func TestTelemetryMiddlewareRecordsErrorResult(t *testing.T) {

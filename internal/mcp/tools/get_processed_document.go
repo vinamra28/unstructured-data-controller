@@ -19,6 +19,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -27,7 +28,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/trace"
 
 	operatorv1alpha1 "github.com/redhat-data-and-ai/unstructured-data-controller/api/v1alpha1"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/auth"
@@ -51,7 +51,7 @@ type getProcessedDocumentArgs struct {
 func RegisterGetProcessedDocument(
 	s *mcp.Server, k8sClient *k8sclient.Client, metricsProvider *udctelemetry.Provider,
 ) {
-	mcp.AddTool(s, &mcp.Tool{
+	registerTool(s, &mcp.Tool{
 		Name: ToolGetProcessedDocument,
 		Description: `Retrieve processed document output from a pipeline's DocumentProcessor stage. Supports exact lookup via file_id or glob pattern matching via file_path_filter (e.g. "*/README.md"). At least one of file_id or file_path_filter is required.
 If pipeline_name is not known, call list_unstructured_data_pipelines_for_user first and follow the instructions in its response.
@@ -66,7 +66,9 @@ On error: report the exact error to the user and STOP. Do NOT retry with other p
 
 		// TelemetryMiddleware already started the tool span; enrich it with
 		// the decoded arguments, which the middleware only sees as raw JSON.
-		trace.SpanFromContext(ctx).SetAttributes(
+		// Bounded and scrubbed: these are client-supplied and the span is
+		// exported.
+		setToolSpanAttributes(ctx,
 			attribute.String("mcp.pipeline_name", args.PipelineName),
 			attribute.String("mcp.file_id", args.FileID),
 			attribute.String("mcp.file_path_filter", args.FilePathFilter))
@@ -136,7 +138,26 @@ On error: report the exact error to the user and STOP. Do NOT retry with other p
 			log.Info("querying snowflake by file_id", "database", databaseName, "schema", schemaName, "table", tableName, "file_id", args.FileID)
 			sfStart := time.Now()
 			doc, queryErr := snowflake.GetProcessedDocument(ctx, oauthToken, databaseName, schemaName, tableName, args.FileID)
-			metricsProvider.RecordExternalCall(ctx, "snowflake", "get_processed_document", time.Since(sfStart), queryErr)
+			// A miss is a successful round trip to Snowflake. Reporting it as
+			// a dependency error would make udc_mcp_external_duration's
+			// outcome="error" share track how often an agent guesses a file
+			// ID wrong, which is exactly the signal an outage alert needs to
+			// be free of.
+			metricsProvider.RecordExternalCall(ctx, "snowflake", "get_processed_document",
+				time.Since(sfStart), dependencyError(queryErr))
+			// A miss is not a failure, and the glob branch below already
+			// treats its own empty result as a normal answer. Returning
+			// IsError here would classify the same user behaviour three
+			// different ways: it also drives udc_mcp_tool_errors and sets the
+			// tool span to Error, so an agent probing file IDs would show up
+			// as a failing tool.
+			if errors.Is(queryErr, snowflake.ErrDocumentNotFound) {
+				log.Info("no processed document for file_id", "file_id", args.FileID)
+				return &mcp.CallToolResult{
+					Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf(
+						"No processed document found for file_id %q in pipeline %q.", args.FileID, args.PipelineName)}},
+				}, nil, nil
+			}
 			if queryErr != nil {
 				log.Error("failed to get processed document", "error", queryErr)
 				return &mcp.CallToolResult{

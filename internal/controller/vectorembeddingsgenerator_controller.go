@@ -44,7 +44,8 @@ import (
 )
 
 const (
-	VectorEmbeddingsGeneratorControllerName = "VectorEmbeddingsGenerator"
+	// Lowercase to match controller-runtime's own metric label; see ObserveReconciler.
+	VectorEmbeddingsGeneratorControllerName = "vectorembeddingsgenerator"
 )
 
 type VectorEmbeddingsGeneratorReconciler struct {
@@ -407,5 +408,6 @@ func (r *VectorEmbeddingsGeneratorReconciler) SetupWithManager(mgr ctrl.Manager)
 		Watches(&operatorv1alpha1.DocumentProcessor{}, handler.EnqueueRequestsFromMapFunc(r.findDependents), builder.WithPredicates(controllerutils.FilesProcessedChangedPredicate{})).
 		Watches(&operatorv1alpha1.ChunksGenerator{}, handler.EnqueueRequestsFromMapFunc(r.findDependents), builder.WithPredicates(controllerutils.FilesProcessedChangedPredicate{})).
 		Watches(&operatorv1alpha1.DestinationSyncer{}, handler.EnqueueRequestsFromMapFunc(r.findDependents), builder.WithPredicates(controllerutils.FilesProcessedChangedPredicate{})).
+		Named(VectorEmbeddingsGeneratorControllerName).
 		Complete(r.Metrics.ObserveReconciler(VectorEmbeddingsGeneratorControllerName, r))
 }

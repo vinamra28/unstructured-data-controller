@@ -44,7 +44,8 @@ import (
 )
 
 // ControllerConfigControllerName identifies this controller in metric labels.
-const ControllerConfigControllerName = "ControllerConfig"
+// Lowercase to match controller-runtime's own metric label; see ObserveReconciler.
+const ControllerConfigControllerName = "controllerconfig"
 
 type Model string
 
@@ -243,6 +244,6 @@ func (r *ControllerConfigReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&operatorv1alpha1.ControllerConfig{}).
 		WithEventFilter(predicate.Or(predicate.GenerationChangedPredicate{}, labelPredicate)).
-		Named("controllerconfig").
+		Named(ControllerConfigControllerName).
 		Complete(r.Metrics.ObserveReconciler(ControllerConfigControllerName, r))
 }

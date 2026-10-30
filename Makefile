@@ -162,9 +162,21 @@ lint-config: golangci-lint ## Verify golangci-lint linter configuration
 
 ##@ Build
 
+# Stamps service.version on every metric and span emitted by a binary built
+# through these targets and the image targets below. A build that bypasses
+# them reports "dev", which is at least honest about being unstamped. VERSION
+# is a Makefile constant, so remember to bump it for a release.
+# := not ?=, and a dedicated name: a developer with LDFLAGS exported in
+# their shell would otherwise silently produce an unstamped build.
+VERSION_LDFLAGS := -X main.version=$(VERSION)
+
 .PHONY: build
 build: manifests generate fmt vet ## Build manager binary.
-	go build -o bin/manager cmd/main.go
+	go build -ldflags "$(VERSION_LDFLAGS)" -o bin/manager cmd/main.go
+
+.PHONY: build-mcp-server
+build-mcp-server: fmt vet ## Build the MCP server binary.
+	go build -ldflags "$(VERSION_LDFLAGS)" -o bin/unstructured-data-mcp-server ./cmd/unstructured-data-mcp-server
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
@@ -175,7 +187,7 @@ run: manifests generate fmt vet ## Run a controller from your host.
 # More info: https://docs.docker.com/develop/develop-images/build_enhancements/
 .PHONY: docker-build
 docker-build: ## Build docker image with the manager.
-	$(CONTAINER_TOOL) build -t ${IMG} .
+	$(CONTAINER_TOOL) build --build-arg VERSION=$(VERSION) -t ${IMG} .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
@@ -183,7 +195,7 @@ docker-push: ## Push docker image with the manager.
 
 .PHONY: docker-build-mcp
 docker-build-mcp: ## Build docker image for the MCP server.
-	$(CONTAINER_TOOL) build -f Dockerfile.mcp -t ${IMG_MCP} .
+	$(CONTAINER_TOOL) build --build-arg VERSION=$(VERSION) -f Dockerfile.mcp -t ${IMG_MCP} .
 
 .PHONY: docker-push-mcp
 docker-push-mcp: ## Push docker image for the MCP server.
@@ -202,7 +214,7 @@ docker-buildx: ## Build and push docker image for the manager for cross-platform
 	sed -e '1 s/\(^FROM\)/FROM --platform=\$$\{BUILDPLATFORM\}/; t' -e ' 1,// s//FROM --platform=\$$\{BUILDPLATFORM\}/' Dockerfile > Dockerfile.cross
 	- $(CONTAINER_TOOL) buildx create --name unstructured-data-controller-builder
 	$(CONTAINER_TOOL) buildx use unstructured-data-controller-builder
-	- $(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --tag ${IMG} -f Dockerfile.cross .
+	- $(CONTAINER_TOOL) buildx build --push --build-arg VERSION=$(VERSION) --platform=$(PLATFORMS) --tag ${IMG} -f Dockerfile.cross .
 	- $(CONTAINER_TOOL) buildx rm unstructured-data-controller-builder
 	rm Dockerfile.cross
 
@@ -211,7 +223,7 @@ docker-buildx-mcp: ## Build and push docker image for the MCP server for cross-p
 	sed -e '1 s/\(^FROM\)/FROM --platform=\$$\{BUILDPLATFORM\}/; t' -e ' 1,// s//FROM --platform=\$$\{BUILDPLATFORM\}/' Dockerfile.mcp > Dockerfile.mcp.cross
 	- $(CONTAINER_TOOL) buildx create --name unstructured-data-controller-builder
 	$(CONTAINER_TOOL) buildx use unstructured-data-controller-builder
-	- $(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --tag ${IMG_MCP} -f Dockerfile.mcp.cross .
+	- $(CONTAINER_TOOL) buildx build --push --build-arg VERSION=$(VERSION) --platform=$(PLATFORMS) --tag ${IMG_MCP} -f Dockerfile.mcp.cross .
 	- $(CONTAINER_TOOL) buildx rm unstructured-data-controller-builder
 	rm Dockerfile.mcp.cross
 

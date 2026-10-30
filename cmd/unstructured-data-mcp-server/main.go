@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -40,10 +41,43 @@ import (
 
 const (
 	serverName     = "unstructured-data-controller"
-	serverVersion  = "0.1.0"
 	defaultAddr    = ":8080"
 	defaultMetrics = ":8000"
+
+	// Shutdown is budgeted against the pod's default terminationGracePeriodSeconds
+	// of 30s (config/mcp/deployment.yaml sets none). The two HTTP servers stop
+	// concurrently within httpShutdownTimeout, then telemetry flushes within
+	// flushTimeout, so the worst case is well under the grace period. Running
+	// them serially on a budget each would push the flush - the stage this
+	// ordering exists to protect - past the point the kubelet SIGKILLs.
+	httpShutdownTimeout = 10 * time.Second
+	flushTimeout        = 5 * time.Second
 )
+
+// version is the build version reported as the service.version resource
+// attribute on every metric and span. Overridden at build time with
+// -ldflags "-X main.version=..."; see the Makefile.
+var version = "dev"
+
+// shutdownHTTPServers stops every server concurrently on one shared deadline
+// and logs any failure. Concurrent because the servers are independent: the
+// MCP listener has no WriteTimeout by design (SSE needs long-lived
+// responses), so letting it run first and alone would spend the whole budget
+// before the others started.
+func shutdownHTTPServers(timeout time.Duration, servers map[string]func(context.Context) error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	for name, shutdown := range servers {
+		wg.Go(func() {
+			if err := shutdown(ctx); err != nil {
+				slog.Error("shutdown error", "server", name, "error", err)
+			}
+		})
+	}
+	wg.Wait()
+}
 
 func main() {
 	logger.Init()
@@ -55,7 +89,7 @@ func main() {
 	metricsProvider, err := udctelemetry.Init(
 		context.Background(), udctelemetry.Config{
 			ServiceName:    serverName,
-			ServiceVersion: serverVersion,
+			ServiceVersion: version,
 			// Tool calls are user-driven and low volume compared to reconcile
 			// loops, and Langfuse usage analytics need every invocation to get
 			// accurate counts. Export all traces.
@@ -93,7 +127,7 @@ func main() {
 	mcpServer := mcp.NewServer(
 		&mcp.Implementation{
 			Name:    serverName,
-			Version: serverVersion,
+			Version: version,
 		},
 		nil,
 	)
@@ -204,10 +238,7 @@ func main() {
 	<-ctx.Done()
 	slog.Info("shutting down MCP server")
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	// Close active MCP sessions concurrently — terminates SSE streams so
+	// Close active MCP sessions concurrently - terminates SSE streams so
 	// Shutdown doesn't block. Shutdown is called first to stop accepting
 	// new connections, preventing new sessions from sneaking in.
 	go func() {
@@ -216,16 +247,25 @@ func main() {
 		}
 	}()
 
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		slog.Error("server shutdown error", "error", err)
-	}
-	if err := metricsSrv.Shutdown(shutdownCtx); err != nil {
-		slog.Error("metrics server shutdown error", "error", err)
-	}
-	// Flush pending OTLP metrics/traces before exit.
-	if err := metricsProvider.Shutdown(shutdownCtx); err != nil {
+	// Each stage gets its own budget rather than sharing one. srv has no
+	// WriteTimeout by design (SSE needs long-lived responses), and a tool call
+	// can sit in the Snowflake retry loop for 9s of backoff alone, so a single
+	// shared deadline is routinely exhausted by srv.Shutdown. Everything after
+	// it would then run on an already-expired context: the OTLP flush would
+	// return ctx.Err() immediately and drop the final metric interval and
+	// every buffered span - precisely the telemetry for the shutdown you were
+	// trying to understand.
+	shutdownHTTPServers(httpShutdownTimeout, map[string]func(context.Context) error{
+		"mcp":     srv.Shutdown,
+		"metrics": metricsSrv.Shutdown,
+	})
+
+	// Flush pending OTLP metrics/traces before exit, on a fresh deadline.
+	flushCtx, cancelFlush := context.WithTimeout(context.Background(), flushTimeout)
+	if err := metricsProvider.Shutdown(flushCtx); err != nil {
 		slog.Error("metrics provider shutdown error", "error", err)
 	}
+	cancelFlush()
 	oauthMiddleware.Close()
 	oauthStore.Close()
 	slog.Info("MCP server stopped")

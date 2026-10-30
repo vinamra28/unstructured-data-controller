@@ -8,7 +8,7 @@ Both binaries use the shared `pkg/telemetry` package, which initializes the OTel
 
 - **OTLP push** -- when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, metrics and traces go to an OTel Collector over gRPC. This is the delivery path for both binaries.
 
-- **Prometheus pull** -- the SDK always builds a Prometheus exporter, but only the MCP server serves it, on a dedicated port (8000, HTTP) kept separate from the MCP protocol traffic on 8080. **The controller does not currently expose a metrics endpoint**: `--metrics-bind-address` is left at its default of `0`, so its `udc_*` instruments are registered on controller-runtime's registry but nothing serves them. Exposing the controller's endpoint is deliberately left to a follow-up change; until then, set `OTEL_EXPORTER_OTLP_ENDPOINT` or the controller emits nothing.
+- **Prometheus pull** -- the SDK always builds a Prometheus exporter, but only the MCP server serves it, on a dedicated port (8000, HTTP) kept separate from the MCP protocol traffic on 8080. **A default install does not expose a controller metrics endpoint**: `config/deploy` leaves `--metrics-bind-address` at its default of `0`, so its `udc_*` instruments are registered on controller-runtime's registry but nothing serves them. Exposing the controller's endpoint is deliberately left to a follow-up change; until then, set `OTEL_EXPORTER_OTLP_ENDPOINT` or the controller emits nothing.
 
 ```
 Controller ── OTLP/gRPC ─┐                      ┌── Datadog   (metrics + traces)
@@ -26,6 +26,10 @@ Both binaries speak OTLP/gRPC to a collector; the collector fans out to backends
 
 **Only `udc_*` metrics travel over OTLP.** controller-runtime's own metrics -- reconcile totals, workqueue depth and latency, client request counts -- are native Prometheus collectors on its registry, not OTel instruments, so the OTLP exporter never sees them. Workqueue depth is usually the first thing you want in Datadog when a controller stalls, and it is not currently reachable by any path: the controller serves no metrics endpoint for a collector to scrape. Getting those into Datadog needs the follow-up that exposes the endpoint, plus a `prometheus` receiver on the collector alongside the OTLP one.
 
+Keeping that claim true takes some care. `telemetry.Init` installs the OTel SDK as the process-wide MeterProvider, which switches on any OTel-aware library in the binary, not just this package -- `google.golang.org/api` wraps its transport in `otelhttp` and resolves the global at construction. `pkg/gdrive` therefore passes `option.WithTelemetryDisabled()` on every client it builds; without it the operator would silently export `http.client.*` series, one set per host x method x status code. A new dependency that instruments itself off the global will need the same treatment.
+
+**The `controller` label is shared.** `udc_reconcile_*` and `controller_runtime_reconcile_*` are served from the same registry and use the same label value, so they can be joined -- `Named()` and the metric label both come from one constant per reconciler. The values are lowercase because that is what controller-runtime already emits; changing them would move an existing label.
+
 ## Configuration
 
 All configuration uses standard [OTel environment variables](https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/) -- no custom flags needed.
@@ -37,8 +41,8 @@ All configuration uses standard [OTel environment variables](https://opentelemet
 | `OTEL_SERVICE_NAME` | Override the default service name in telemetry data. | set by the binary |
 | `OTEL_RESOURCE_ATTRIBUTES` | Additional resource attributes, as `key=value` pairs. | unset |
 | `OTEL_SDK_DISABLED` | Set to `true` to turn telemetry off. No Prometheus collector is registered and no OTLP connection is opened. Read once at startup, so changing it needs a pod restart or rollout -- it is not a live kill switch. | `false` |
-| `OTEL_TRACES_SAMPLER` | Sampler name (e.g. `always_off`, `traceidratio`). When set, it replaces the binary's built-in sampler entirely. | unset (binary's own ratio applies) |
-| `OTEL_TRACES_SAMPLER_ARG` | Sampling ratio between 0 and 1. | binary's own ratio |
+| `OTEL_TRACES_SAMPLER` | Sampler name (e.g. `always_off`, `traceidratio`). When set, it replaces the binary's built-in sampler entirely. Only has an effect alongside `OTEL_EXPORTER_OTLP_ENDPOINT`, since no tracer is built without one. | unset (binary's own ratio applies) |
+| `OTEL_TRACES_SAMPLER_ARG` | Sampling ratio between 0 and 1. Same caveat as above. | binary's own ratio |
 
 Not yet supported: the per-signal endpoint variables (`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`) and `OTEL_EXPORTER_OTLP_PROTOCOL`. OTLP is gated on `OTEL_EXPORTER_OTLP_ENDPOINT` alone and always uses gRPC.
 
@@ -62,7 +66,7 @@ OTEL_EXPORTER_OTLP_INSECURE: "true"
 
 ### Prometheus scraping
 
-**The controller has no metrics endpoint to scrape.** `--metrics-bind-address` is left at its default of `0`, so controller-runtime serves nothing and neither the `udc_*` instruments nor controller-runtime's own metrics are readable by pull. OTLP push is the controller's only delivery path today. Exposing the endpoint is a planned follow-up; it needs more than flipping the flag:
+**A default install has no controller metrics endpoint to scrape.** `config/deploy`, the overlay `make deploy` builds, leaves `--metrics-bind-address` at its default of `0`, so controller-runtime serves nothing and neither the `udc_*` instruments nor controller-runtime's own metrics are readable by pull. OTLP push is the controller's only delivery path today. Exposing the endpoint is a planned follow-up; it needs more than flipping the flag:
 
 - The scaffolded `config/default/manager_metrics_patch.yaml` inserts the flag at `args[0]`, **ahead of** `/manager`. This image's ENTRYPOINT is `entrypoint.sh`, which ends in `exec "$@"`, so `args[0]` is the binary to exec. Applying that patch as written makes the flag the command and the pod CrashLoopBackOffs. The flag has to be appended, not prepended.
 - `config/deploy` (what `make deploy` builds) pulls in only `../rbac` and `../manager`, so it picks up neither that patch nor `config/default/metrics_service.yaml`.
@@ -99,9 +103,9 @@ Recorded per reconcile loop. All metrics include a `controller` attribute identi
 Prometheus names follow OTel conventions (dots become underscores, counters get `_total` suffix):
 
 ```
-udc_reconcile_count_total{controller="DocumentProcessor"} 42
-udc_reconcile_duration_seconds_bucket{controller="SourceCrawler",le="1"} 15
-udc_files_processed_total{controller="ChunksGenerator"} 1200
+udc_reconcile_count_total{controller="documentprocessor"} 42
+udc_reconcile_duration_seconds_bucket{controller="sourcecrawler",le="1"} 15
+udc_files_processed_total{controller="chunksgenerator"} 1200
 ```
 
 ### MCP Server metrics
@@ -296,18 +300,35 @@ func MyExternalCall(ctx context.Context, ...) (result T, err error) {
 
 ### Verify Prometheus metrics (no collector needed)
 
-```bash
-# Build and run the MCP server
-go build -o /tmp/mcp-server ./cmd/unstructured-data-mcp-server
+Only the MCP server serves `/metrics` in a default install; the controller does not (see above). The
+server needs a reachable Kubernetes API, so run it with a kubeconfig pointing at
+a cluster or a `kind` instance - without one it exits before the listener binds.
 
+```bash
+make build-mcp-server   # writes bin/unstructured-data-mcp-server
+
+KUBECONFIG=~/.kube/config \
 SSO_AUTHORIZATION_URL=http://localhost \
 SSO_TOKEN_URL=http://localhost \
 SSO_CALLBACK_URL=http://localhost \
 SSO_DISABLE_INTROSPECTION=true \
-/tmp/mcp-server &
+bin/unstructured-data-mcp-server &
+```
 
-# Check for custom metrics
+A counter does not appear on `/metrics` until it has been incremented at least
+once, so a freshly started server shows no `udc_` series. Exercise a tool first,
+then scrape:
+
+```bash
 curl -s http://localhost:8000/metrics | grep udc_
+```
+
+The MCP server serves a dedicated registry that deliberately excludes Go and
+process collectors, so before any tool has run the only series present is
+`target_info`. Its presence is how you confirm the endpoint is up:
+
+```bash
+curl -s http://localhost:8000/metrics | grep target_info
 ```
 
 ### Verify OTLP push with a local collector

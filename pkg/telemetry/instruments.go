@@ -177,7 +177,7 @@ func (o *ReconcileObserver) End(ctx context.Context, retErr *error) {
 // RecordFilesProcessed increments the files-processed counter for a controller.
 // Safe to call on a nil Provider.
 func (p *Provider) RecordFilesProcessed(ctx context.Context, controllerName string, count int64) {
-	if p == nil {
+	if p == nil || p.instruments == nil {
 		return
 	}
 	p.instruments.filesProcessed.Add(ctx, count,
@@ -199,7 +199,7 @@ func (p *Provider) RecordFilesProcessed(ctx context.Context, controllerName stri
 func (p *Provider) ToolObserver(
 	ctx context.Context, toolName string, spanAttrs ...attribute.KeyValue,
 ) (context.Context, func(cause string)) {
-	if p == nil {
+	if p == nil || p.instruments == nil {
 		return ctx, func(string) {}
 	}
 
@@ -243,7 +243,7 @@ func callOutcome(err error) string {
 func (p *Provider) RecordExternalCall(
 	ctx context.Context, service, operation string, duration time.Duration, err error,
 ) {
-	if p == nil {
+	if p == nil || p.instruments == nil {
 		return
 	}
 	// outcome is what makes this histogram usable for alerting. It is the only
@@ -260,10 +260,22 @@ func (p *Provider) RecordExternalCall(
 	if err == nil {
 		return
 	}
-	// Downstream errors can embed connection strings, SQL text, or tokens.
-	// Sanitize before the message leaves the process for Datadog/Langfuse.
-	safeMsg := sanitize(err.Error())
-	span := trace.SpanFromContext(ctx)
-	span.RecordError(errors.New(safeMsg))
-	span.SetStatus(codes.Error, safeMsg)
+	// Record an event, but do NOT set the span status.
+	//
+	// ctx here is the caller's span, not the callee's: the pkg/ functions
+	// start and end their own span internally and that context never escapes,
+	// so SpanFromContext resolves to the tool span. The callee has already
+	// marked its own span via RecordSpanError, and the tool observer sets the
+	// tool span's status from the handler's outcome when the call finishes.
+	// Setting it here too would make the final status whichever of the three
+	// ran last, and would force the tool span to Error even when the handler
+	// recovered and returned a successful result.
+	//
+	// Downstream errors can embed connection strings, SQL text, or tokens, so
+	// the message is sanitized before it leaves the process.
+	trace.SpanFromContext(ctx).AddEvent("external.call.failed", trace.WithAttributes(
+		attribute.String("service", service),
+		attribute.String("operation", operation),
+		attribute.String("error.message", sanitize(err.Error())),
+	))
 }

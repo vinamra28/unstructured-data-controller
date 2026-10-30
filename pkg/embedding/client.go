@@ -18,6 +18,24 @@ import (
 
 const (
 	HTTPClientTimeout = 60 * time.Second
+
+	// maxResponseBytes caps how much of an embedding response this process
+	// will read, so an unhealthy or hostile endpoint cannot drive it to
+	// allocate without bound.
+	//
+	// It has to clear a legitimate worst case by a wide margin. At the
+	// default batch size of 1000 (api/v1alpha1.DefaultEmbeddingBatchSize,
+	// and the CRD sets no maximum), a JSON response runs about 20 MiB at 1024
+	// dimensions, 60 MiB at 3072 and 81 MiB at 4096 - and 3072 and 4096 are
+	// mainstream model sizes. A cap below that would reject ordinary traffic
+	// at the shipped default.
+	maxResponseBytes = 256 << 20
+
+	// maxErrorBodyBytes caps how much of a non-200 body is read in order to
+	// quote it. Vendor-controlled text that travels with an error reaches a
+	// span, the controller log and a CR status condition, so both its volume
+	// and its content are bounded - see the call site.
+	maxErrorBodyBytes = 512
 )
 
 type EmbeddingGenerator interface {
@@ -134,17 +152,43 @@ func (c *HTTPClient) GenerateEmbeddings(
 		}
 	}()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read embedding response: %w", err)
-	}
-
+	// The status check comes before any read of the body, so a 502 HTML page
+	// or a hostile endpoint cannot make this process buffer megabytes just to
+	// produce a short quote.
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(body))
+		// Read only what will be quoted. SafeAttributeValue both bounds and
+		// scrubs: the body is vendor-controlled, OpenAI-compatible servers
+		// echo the presented API key back in 401 bodies, and this error does
+		// not only reach a span. It is also written verbatim into the
+		// VectorEmbeddingsGenerator status condition
+		// (api/v1alpha1.UpdateStatus appends err.Error() to the message), so
+		// it is readable by anyone with get on the CR. The span sanitizer
+		// does not cover that path; scrubbing here does.
+		errBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+		if readErr != nil {
+			return nil, fmt.Errorf("API returned status %d (error body unreadable: %w)",
+				resp.StatusCode, readErr)
+		}
+		return nil, fmt.Errorf("API returned status %d: %s",
+			resp.StatusCode, udctelemetry.SafeAttributeValue(string(errBody)))
 	}
 
+	// Decode as a stream rather than buffering the whole body first. At the
+	// default batch size of 1000 a 4096-dimension response is around 80 MiB,
+	// and io.ReadAll reaches that by repeated doubling - roughly 1.4 GiB of
+	// cumulative allocation with 500 MiB live at the final copy, against the
+	// MCP server's 512Mi limit. Streaming keeps the peak at the decoder's
+	// buffer plus the result.
+	//
+	// LimitedReader is kept addressable so an over-long body is reported as
+	// itself rather than as "unexpected end of JSON input", which says
+	// nothing about the cause and would recur on every retry.
+	limited := &io.LimitedReader{R: resp.Body, N: maxResponseBytes + 1}
 	var embResp EmbeddingResponse
-	if err := json.Unmarshal(body, &embResp); err != nil {
+	if err := json.NewDecoder(limited).Decode(&embResp); err != nil {
+		if limited.N == 0 {
+			return nil, fmt.Errorf("embedding response exceeds %d bytes", maxResponseBytes)
+		}
 		return nil, fmt.Errorf("failed to decode embedding response: %w", err)
 	}
 

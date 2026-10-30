@@ -47,6 +47,13 @@ type observedReconciler struct {
 // defer inside Reconcile while the named error return is still nil, and would
 // otherwise be counted as a success.
 //
+// controllerName must be the same string the builder's Named() receives (or,
+// absent Named(), strings.ToLower of the Kind, which is what controller-runtime
+// derives). Both metric families land on one Prometheus registry, so a
+// mismatch means udc_reconcile_* and controller_runtime_reconcile_* cannot be
+// joined on the controller label and a dashboard built from one selects
+// nothing in the other.
+//
 // Safe to call on a nil Provider; inner is then returned undecorated.
 func (p *Provider) ObserveReconciler(controllerName string, inner reconcile.Reconciler) reconcile.Reconciler {
 	if p == nil || p.instruments == nil {

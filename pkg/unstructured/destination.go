@@ -13,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	smithy "github.com/aws/smithy-go"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/filestore"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -24,6 +25,21 @@ type Destination interface {
 	// len(filePaths). On error the count covers the uploads that completed
 	// before the failure.
 	SyncFilesToDestination(ctx context.Context, fs *filestore.FileStore, filePaths []string) (int, error)
+}
+
+// isForbidden reports whether err is S3 denying the caller permission, as
+// opposed to the object being absent or the request failing.
+func isForbidden(err error) bool {
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	switch apiErr.ErrorCode() {
+	case "Forbidden", "AccessDenied", "AllAccessDisabled":
+		return true
+	default:
+		return false
+	}
 }
 
 // S3Destination syncs files to an S3 bucket at prefix/stages/<stageName>/.
@@ -105,13 +121,22 @@ func (d *S3Destination) SyncFilesToDestination(ctx context.Context, fs *filestor
 			ChecksumMode: types.ChecksumModeEnabled,
 		})
 
+		// A missing object is the normal first-upload case and means "go
+		// ahead and PUT". A 403 means this role may write but not read, which
+		// is a legitimate destination policy (and the same answer an SSE-KMS
+		// bucket gives without kms:Decrypt): the checksum cannot be compared,
+		// so the only safe action is to upload. Everything else - 503
+		// SlowDown, a network timeout - is a real fault and must not be
+		// mistaken for absence, because treating it so re-PUTs every object
+		// in the stage, inflating the uploaded count and the bill while
+		// hiding the fault.
+		//
+		// Note that only *types.NotFound deserializes to a typed error here;
+		// the rest arrive as *smithy.GenericAPIError, so the code has to be
+		// read off the APIError interface.
 		var notFoundErr *types.NotFound
-		if err != nil && errors.As(err, &notFoundErr) {
-			if notFoundErr.ErrorCode() != "NotFound" {
-				logger.Info("error while fetching the object",
-					"key", key, "error", err.Error())
-				return uploaded, fmt.Errorf("head object s3://%s/%s: %w", d.Bucket, key, err)
-			}
+		if err != nil && !errors.As(err, &notFoundErr) && !isForbidden(err) {
+			return uploaded, fmt.Errorf("head object s3://%s/%s: %w", d.Bucket, key, err)
 		}
 
 		if err == nil && headResp.ChecksumSHA256 != nil && *headResp.ChecksumSHA256 == localSHA256 {

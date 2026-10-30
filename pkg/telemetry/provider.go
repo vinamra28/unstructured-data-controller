@@ -21,9 +21,11 @@ package telemetry
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -74,12 +76,6 @@ type Config struct {
 	Logger logr.Logger
 }
 
-// errorHandlerFunc adapts a function to otel.ErrorHandler, which this version
-// of the API does not provide an adapter for.
-type errorHandlerFunc func(error)
-
-func (f errorHandlerFunc) Handle(err error) { f(err) }
-
 // Provider manages OTel MeterProvider and TracerProvider lifecycle.
 // It supports dual export: Prometheus (always on) and OTLP gRPC (when OTEL_EXPORTER_OTLP_ENDPOINT is set).
 //
@@ -105,7 +101,7 @@ func Init(ctx context.Context, cfg Config) (_ *Provider, retErr error) {
 	// still better than installing a handler that silently drops errors.
 	if cfg.Logger.GetSink() != nil {
 		otel.SetLogger(cfg.Logger)
-		otel.SetErrorHandler(errorHandlerFunc(func(err error) {
+		otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
 			cfg.Logger.Error(err, "OpenTelemetry SDK error")
 		}))
 	}
@@ -170,6 +166,8 @@ func Init(ctx context.Context, cfg Config) (_ *Provider, retErr error) {
 		}
 	}()
 
+	// tp is nil when no OTLP endpoint is configured, which leaves the global
+	// TracerProvider at its no-op default so span creation costs nothing.
 	tp, err := setupTracerProvider(ctx, res, cfg)
 	if err != nil {
 		return nil, err
@@ -178,6 +176,9 @@ func Init(ctx context.Context, cfg Config) (_ *Provider, retErr error) {
 
 	inst, err := newInstruments(p.meterProvider)
 	if err != nil {
+		if tp == nil {
+			return nil, err
+		}
 		// Clean up the TracerProvider we just created.
 		return nil, errors.Join(err, shutdownBounded(tp.Shutdown))
 	}
@@ -185,8 +186,16 @@ func Init(ctx context.Context, cfg Config) (_ *Provider, retErr error) {
 
 	// Set globals only after all components are ready, so a partial failure
 	// never leaves the process with half-initialized global providers.
+	//
+	// Note that this turns on any OTel-aware library in the binary, not just
+	// this package: google.golang.org/api wraps its transport in otelhttp,
+	// which resolves the global MeterProvider at construction. pkg/gdrive
+	// disables that explicitly so the exported metrics stay the udc_* set
+	// this package defines.
 	otel.SetMeterProvider(p.meterProvider)
-	otel.SetTracerProvider(p.tracerProvider)
+	if p.tracerProvider != nil {
+		otel.SetTracerProvider(p.tracerProvider)
+	}
 
 	meterProviderReady = true
 	return p, nil
@@ -254,33 +263,89 @@ func (p *Provider) setupPrometheusReader(cfg Config) (sdkmetric.Reader, error) {
 	return promexporter.New(opts...)
 }
 
-// setupTracerProvider creates a TracerProvider with optional OTLP export.
-// When OTEL_EXPORTER_OTLP_ENDPOINT is not set, the provider is created without
-// an exporter - traces are no-ops (zero overhead, no data sent).
+// sdkTraceSamplers are the names the SDK's own OTEL_TRACES_SAMPLER parser
+// accepts (vendor/go.opentelemetry.io/otel/sdk/trace/sampler_env.go). The
+// value has to be checked against this set rather than merely tested for
+// emptiness: on an unrecognised name samplerFromEnv returns an error, the
+// provider reports it and then falls back to ParentBased(AlwaysSample()), so
+// a typo like "always-off" would silently mean 100% sampling - the opposite
+// of what the operator asked for, at the worst possible moment.
+var sdkTraceSamplers = map[string]bool{
+	"always_on":                true,
+	"always_off":               true,
+	"traceidratio":             true,
+	"parentbased_always_on":    true,
+	"parentbased_always_off":   true,
+	"parentbased_traceidratio": true,
+}
+
+// setupTracerProvider creates a TracerProvider, or returns nil when no OTLP
+// endpoint is configured.
+//
+// Returning nil matters: a TracerProvider with no exporter is NOT free.
+// Whether a span records is decided by the sampler alone, so the SDK would
+// allocate a full recordingSpan, store every attribute and only discard it at
+// End(). Measured at ~325 ns and 528 B per span, on every tool call and every
+// instrumented client call. Leaving the API global as its default no-op makes
+// span creation genuinely free when telemetry is not being exported.
 func setupTracerProvider(
 	ctx context.Context, res *resource.Resource, cfg Config,
 ) (*sdktrace.TracerProvider, error) {
+	if os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT") == "" {
+		return nil, nil
+	}
+
+	traceExporter, err := otlptracegrpc.New(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	tpOpts := []sdktrace.TracerProviderOption{
 		sdktrace.WithResource(res),
+		sdktrace.WithBatcher(traceExporter),
+		// The SDK default AttributeValueLengthLimit is -1, i.e. unlimited.
+		// Several attributes are client-controlled - MCP tool arguments reach
+		// pipeline.name on a pkg/k8sclient span, for instance - so the bound
+		// belongs here rather than at each recording site, where every new
+		// attribute would have to remember it.
+		sdktrace.WithRawSpanLimits(spanLimits()),
 	}
 
-	// WithSampler overrides OTEL_TRACES_SAMPLER outright, so it is only applied
-	// when the operator has not named a sampler. Leaving it off lets the SDK
-	// read the variable itself, which is what someone setting always_off to
-	// protect an overloaded collector mid-incident expects to happen.
-	if os.Getenv("OTEL_TRACES_SAMPLER") == "" {
-		tpOpts = append(tpOpts, sdktrace.WithSampler(traceSampler(cfg.TraceSampleRatio)))
-	}
-
-	if os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT") != "" {
-		traceExporter, err := otlptracegrpc.New(ctx)
-		if err != nil {
-			return nil, err
-		}
-		tpOpts = append(tpOpts, sdktrace.WithBatcher(traceExporter))
+	if sampler := samplerOverride(cfg.TraceSampleRatio); sampler != nil {
+		tpOpts = append(tpOpts, sdktrace.WithSampler(sampler))
 	}
 
 	return sdktrace.NewTracerProvider(tpOpts...), nil
+}
+
+// spanLimits caps attribute values so no single span can carry an unbounded
+// payload to the telemetry backend. Other limits keep the SDK defaults.
+//
+// NewSpanLimits supplies those defaults and WithRawSpanLimits applies the
+// struct verbatim, which is what makes an explicit value here meaningful:
+// the deprecated WithSpanLimits rewrites any non-positive field back to a
+// default, so it cannot express a real bound.
+func spanLimits() sdktrace.SpanLimits {
+	limits := sdktrace.NewSpanLimits()
+	limits.AttributeValueLengthLimit = maxMessageLen
+	return limits
+}
+
+// samplerOverride returns the sampler this binary should impose, or nil to
+// let the SDK read OTEL_TRACES_SAMPLER itself.
+//
+// WithSampler overrides that variable outright, so it is withheld only when
+// the variable names a sampler the SDK actually understands - which is what
+// someone setting always_off to protect an overloaded collector expects. The
+// membership test matters: on an unrecognised name the SDK's parser errors
+// and the provider falls back to ParentBased(AlwaysSample()), so deferring on
+// any non-empty value would turn a typo like "always-off" into 100% sampling.
+func samplerOverride(ratio float64) sdktrace.Sampler {
+	name := strings.ToLower(strings.TrimSpace(os.Getenv("OTEL_TRACES_SAMPLER")))
+	if sdkTraceSamplers[name] {
+		return nil
+	}
+	return traceSampler(ratio)
 }
 
 // traceSampler builds an explicit sampler. The SDK default is AlwaysSample,
@@ -292,14 +357,39 @@ func setupTracerProvider(
 // already made a sampling decision, child spans here honour it rather than
 // re-rolling and producing partial traces.
 func traceSampler(ratio float64) sdktrace.Sampler {
-	if ratio <= 0 || ratio > 1 {
+	// Zero is the Go zero value of Config.TraceSampleRatio and means "the
+	// caller did not choose", so it takes the SDK's own default of 1.0.
+	// Out-of-range values are clamped rather than reset to 1.0: a caller
+	// passing a negative ratio is asking for less sampling, and answering
+	// that with 100% would be the most expensive possible reading of the
+	// request. Operators who want none should set OTEL_TRACES_SAMPLER_ARG=0
+	// or OTEL_TRACES_SAMPLER=always_off.
+	switch {
+	case ratio == 0:
 		ratio = 1.0
+	case ratio < 0:
+		ratio = 0
+	case ratio > 1:
+		ratio = 1.0
+	default:
+		// In range and non-zero: use it as given.
 	}
+
 	if v := os.Getenv("OTEL_TRACES_SAMPLER_ARG"); v != "" {
-		if parsed, err := strconv.ParseFloat(v, 64); err == nil && parsed >= 0 && parsed <= 1 {
+		parsed, err := strconv.ParseFloat(v, 64)
+		// Positive test, not a negated range: ParseFloat accepts "NaN" with a
+		// nil error, and NaN compares false against every relational
+		// operator, so `parsed < 0 || parsed > 1` would wave it through and
+		// TraceIDRatioBased{NaN} samples nothing.
+		if err != nil || !(parsed >= 0 && parsed <= 1) {
+			// Logged rather than swallowed: silently ignoring it leaves the
+			// operator believing a sampling rate is in force that is not.
+			otel.Handle(fmt.Errorf("ignoring invalid OTEL_TRACES_SAMPLER_ARG %q: want a number in [0,1]", v))
+		} else {
 			ratio = parsed
 		}
 	}
+
 	return sdktrace.ParentBased(sdktrace.TraceIDRatioBased(ratio))
 }
 
@@ -307,7 +397,7 @@ func traceSampler(ratio float64) sdktrace.Sampler {
 // Returns nil when the provider was initialized with an external registerer
 // (controller case, where metrics are served by controller-runtime's built-in endpoint).
 func (p *Provider) PrometheusHandler() http.Handler {
-	if p.promGatherer == nil {
+	if p == nil || p.promGatherer == nil {
 		return nil
 	}
 	return promhttp.HandlerFor(p.promGatherer, promhttp.HandlerOpts{})
@@ -315,7 +405,18 @@ func (p *Provider) PrometheusHandler() http.Handler {
 
 // Shutdown flushes pending telemetry and releases resources.
 // Safe to call multiple times.
+//
+// Call this after manager.Start returns rather than registering the Provider
+// as a manager.Runnable. A Runnable reporting NeedLeaderElection()==false
+// goes into controller-runtime's `Others` group, which the manager stops
+// BEFORE the LeaderElection group holding the reconcilers - so telemetry
+// would be torn down while every controller was still draining, losing
+// exactly the reconciles worth observing. Budget the caller's shutdown so
+// this still runs inside the pod's termination grace period.
 func (p *Provider) Shutdown(ctx context.Context) error {
+	if p == nil {
+		return nil
+	}
 	var errs []error
 	if p.meterProvider != nil {
 		if err := p.meterProvider.Shutdown(ctx); err != nil {
@@ -329,19 +430,3 @@ func (p *Provider) Shutdown(ctx context.Context) error {
 	}
 	return errors.Join(errs...)
 }
-
-// Start implements manager.Runnable for controller-runtime lifecycle integration.
-// It blocks until the context is cancelled, then flushes and shuts down the providers.
-func (p *Provider) Start(ctx context.Context) error {
-	<-ctx.Done()
-	// Use a bounded timeout so a slow OTLP flush doesn't stall the manager
-	// shutdown past the pod's terminationGracePeriodSeconds.
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	return p.Shutdown(shutdownCtx)
-}
-
-// NeedLeaderElection returns false so telemetry runs on every replica,
-// not just the leader. Without this, non-leader replicas never call Start
-// and their providers are never shut down.
-func (*Provider) NeedLeaderElection() bool { return false }

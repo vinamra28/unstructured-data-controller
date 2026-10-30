@@ -51,7 +51,8 @@ import (
 )
 
 const (
-	SourceCrawlerControllerName  = "SourceCrawler"
+	// Lowercase to match controller-runtime's own metric label; see ObserveReconciler.
+	SourceCrawlerControllerName  = "sourcecrawler"
 	defaultCrawlerResyncInterval = 2 * time.Minute
 	defaultGitPollInterval       = 5 * time.Minute
 )
@@ -146,10 +147,28 @@ func (r *SourceCrawlerReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	case operatorv1alpha1.TypeGit:
 		storedFiles, repoStatus, err := r.buildAndSyncGitRepos(ctx, sourceCrawlerCR, sourceCrawlerConfig.GitConfig, outputDir)
 		if err != nil {
+			// buildAndSyncGitRepos accumulates across repos before reporting a
+			// per-repo failure, so a non-empty storedFiles can arrive with a
+			// non-nil error. Those files are on disk and the next reconcile
+			// skips their repos as unchanged, so the metric has to take them
+			// now or they are counted nowhere.
+			//
+			// Status.FilesProcessed is deliberately left alone: main does not
+			// move it on this path, it is a user-visible field, and
+			// FilesProcessedChangedPredicate wakes four other controllers off
+			// it - so bumping it here would wake them on every backoff tick of
+			// a persistently failing sync.
 			if patchErr := controllerutils.StatusPatch(ctx, r.Client, sourceCrawlerCR, func() {
 				sourceCrawlerCR.Status.GitRepoStatus = repoStatus
 			}); patchErr != nil {
 				logger.Error(patchErr, "failed to update SourceCrawler CR status with git repo status")
+			} else {
+				// Only on a successful patch. GitRepoStatus is what makes the
+				// next reconcile skip the repos that did sync; if persisting
+				// it failed, those repos are re-cloned and re-stored next
+				// time and counting now would add them again on every
+				// backoff tick.
+				r.Metrics.RecordFilesProcessed(ctx, SourceCrawlerControllerName, int64(len(storedFiles)))
 			}
 			return ctrl.Result{}, r.handleError(ctx, sourceCrawlerCR, err)
 		}
@@ -614,6 +633,6 @@ func (r *SourceCrawlerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&operatorv1alpha1.VectorEmbeddingsGenerator{}, handler.EnqueueRequestsFromMapFunc(r.findDependents), builder.WithPredicates(controllerutils.FilesProcessedChangedPredicate{})).
 		Watches(&operatorv1alpha1.DestinationSyncer{}, handler.EnqueueRequestsFromMapFunc(r.findDependents), builder.WithPredicates(controllerutils.FilesProcessedChangedPredicate{})).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.findSecretDependents)).
-		Named("sourcecrawler").
+		Named(SourceCrawlerControllerName).
 		Complete(r.Metrics.ObserveReconciler(SourceCrawlerControllerName, r))
 }

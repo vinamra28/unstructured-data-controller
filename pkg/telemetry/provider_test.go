@@ -151,47 +151,106 @@ func TestInitIgnoresMalformedSDKDisabled(t *testing.T) {
 	assert.NotNil(t, provider.meterProvider, "malformed OTEL_SDK_DISABLED should leave the SDK enabled")
 }
 
-func TestInitDefersToOTELTracesSampler(t *testing.T) {
+// TestInitSkipsTracerProviderWithoutAnEndpoint pins the costly default: a
+// TracerProvider with no exporter still allocates a full recording span per
+// Start and discards it at End. Leaving the global at its no-op default is
+// what actually makes span creation free when nothing is exporting.
+func TestInitSkipsTracerProviderWithoutAnEndpoint(t *testing.T) {
 	preserveGlobals(t)
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
 	t.Setenv("OTEL_SDK_DISABLED", "")
-	// always_off is what an operator reaches for to protect an overloaded
-	// collector. WithSampler would override it outright, so Init must not
-	// apply its own sampler when this is set.
-	t.Setenv("OTEL_TRACES_SAMPLER", "always_off")
 
 	provider, err := Init(context.Background(), Config{
-		ServiceName:    "test-service",
-		ServiceVersion: "0.0.1",
-		// Would otherwise force 100% sampling and mask the env var.
-		TraceSampleRatio: 1.0,
+		ServiceName:          "test-service",
+		ServiceVersion:       "0.0.1",
+		PrometheusRegisterer: prometheus.NewRegistry(),
+		TraceSampleRatio:     1.0,
 	})
 	require.NoError(t, err)
 	defer func() { require.NoError(t, provider.Shutdown(context.Background())) }()
 
-	_, span := provider.tracerProvider.Tracer("test").Start(context.Background(), "op")
+	assert.Nil(t, provider.tracerProvider,
+		"no OTLP endpoint means no TracerProvider, so spans cost nothing")
+
+	_, span := otel.Tracer("test").Start(context.Background(), "op")
 	defer span.End()
-	assert.False(t, span.IsRecording(), "OTEL_TRACES_SAMPLER=always_off should win over TraceSampleRatio")
+	assert.False(t, span.IsRecording(),
+		"the global tracer must stay a no-op when nothing is exporting")
 }
 
-func TestInitAppliesConfiguredSamplerWithoutTheEnvVar(t *testing.T) {
-	preserveGlobals(t)
-	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
-	t.Setenv("OTEL_SDK_DISABLED", "")
-	t.Setenv("OTEL_TRACES_SAMPLER", "")
-	t.Setenv("OTEL_TRACES_SAMPLER_ARG", "")
+// The sampler decision is tested through samplerOverride rather than through
+// Init: building a real TracerProvider needs an OTLP exporter, whose shutdown
+// blocks on a dial that nothing answers, which costs ~15s per case.
+func TestSamplerOverrideDefersToRecognisedSDKSamplers(t *testing.T) {
+	// Every name the SDK's own parser accepts must be left to the SDK, or
+	// WithSampler silently overrides the operator's choice.
+	for _, name := range []string{
+		"always_on", "always_off", "traceidratio",
+		"parentbased_always_on", "parentbased_always_off", "parentbased_traceidratio",
+		"  ALWAYS_OFF  ", // the SDK lowercases and trims, so this must too
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("OTEL_TRACES_SAMPLER", name)
+			assert.Nil(t, samplerOverride(1.0),
+				"a sampler the SDK understands must be left to the SDK")
+		})
+	}
+}
 
-	provider, err := Init(context.Background(), Config{
-		ServiceName:      "test-service",
-		ServiceVersion:   "0.0.1",
-		TraceSampleRatio: 1.0,
-	})
-	require.NoError(t, err)
-	defer func() { require.NoError(t, provider.Shutdown(context.Background())) }()
+// TestSamplerOverrideIgnoresUnrecognisedNames is the fail-open regression
+// test. On a name the SDK does not know, samplerFromEnv returns an error and
+// the SDK falls back to ParentBased(AlwaysSample()) - so deferring on any
+// non-empty value turns a typo'd kill switch into 100% sampling.
+func TestSamplerOverrideIgnoresUnrecognisedNames(t *testing.T) {
+	for _, name := range []string{"", "always-off", "alwaysoff", "off", "nonsense"} {
+		t.Run("name="+name, func(t *testing.T) {
+			t.Setenv("OTEL_TRACES_SAMPLER", name)
+			t.Setenv("OTEL_TRACES_SAMPLER_ARG", "")
 
-	_, span := provider.tracerProvider.Tracer("test").Start(context.Background(), "op")
-	defer span.End()
-	assert.True(t, span.IsRecording(), "the configured ratio should apply when no sampler env var is set")
+			sampler := samplerOverride(0.1)
+			require.NotNil(t, sampler,
+				"an unrecognised name must not hand control to the SDK's 100%% fallback")
+			assert.Contains(t, sampler.Description(), "TraceIDRatioBased{0.1}",
+				"the configured ratio should be the one in force")
+		})
+	}
+}
+
+func TestTraceSamplerClampsOutOfRangeRatios(t *testing.T) {
+	tests := []struct {
+		name        string
+		ratio       float64
+		wantInDescr string
+	}{
+		// Zero is the Go zero value, meaning "unset", so it takes the SDK default.
+		{name: "zero means unset", ratio: 0, wantInDescr: "TraceIDRatioBased{1}"},
+		{name: "normal ratio", ratio: 0.25, wantInDescr: "TraceIDRatioBased{0.25}"},
+		// A negative ratio is a request for less, so it must never become more.
+		{name: "negative clamps to none", ratio: -1, wantInDescr: "TraceIDRatioBased{0}"},
+		{name: "above one clamps to all", ratio: 7, wantInDescr: "TraceIDRatioBased{1}"},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Setenv("OTEL_TRACES_SAMPLER_ARG", "")
+			assert.Contains(t, traceSampler(testCase.ratio).Description(), testCase.wantInDescr)
+		})
+	}
+}
+
+func TestTraceSamplerHonoursSamplerArg(t *testing.T) {
+	t.Setenv("OTEL_TRACES_SAMPLER_ARG", "0")
+	assert.Contains(t, traceSampler(1.0).Description(), "TraceIDRatioBased{0}",
+		"an explicit arg of 0 must turn sampling off, not be treated as unset")
+
+	// An unusable value must leave the configured ratio alone rather than
+	// silently inventing one.
+	for _, bad := range []string{"0,5", "50", "-1", "abc"} {
+		t.Run("invalid="+bad, func(t *testing.T) {
+			t.Setenv("OTEL_TRACES_SAMPLER_ARG", bad)
+			assert.Contains(t, traceSampler(0.25).Description(), "TraceIDRatioBased{0.25}")
+		})
+	}
 }
 
 func TestInitWithDefaults(t *testing.T) {
@@ -207,7 +266,8 @@ func TestInitWithDefaults(t *testing.T) {
 	defer func() { require.NoError(t, p.Shutdown(context.Background())) }()
 
 	assert.NotNil(t, p.meterProvider, "MeterProvider should be initialized")
-	assert.NotNil(t, p.tracerProvider, "TracerProvider should be initialized")
+	assert.Nil(t, p.tracerProvider,
+		"no TracerProvider without an OTLP endpoint - see TestInitSkipsTracerProviderWithoutAnEndpoint")
 	assert.NotNil(t, p.instruments, "instruments should be initialized")
 }
 
@@ -276,43 +336,4 @@ func TestShutdownIsIdempotent(t *testing.T) {
 	// Second shutdown should not panic or return an unexpected error.
 	// The OTel SDK may return an error on double shutdown, but it should not panic.
 	_ = p.Shutdown(context.Background())
-}
-
-func TestStartBlocksUntilContextCancelled(t *testing.T) {
-	preserveGlobals(t)
-	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
-
-	p, err := Init(context.Background(), Config{
-		ServiceName:    "test-service",
-		ServiceVersion: "0.0.1",
-	})
-	require.NoError(t, err)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-
-	go func() {
-		done <- p.Start(ctx)
-	}()
-
-	// Start should be blocking.
-	select {
-	case <-done:
-		t.Fatal("Start returned before context was cancelled")
-	case <-time.After(50 * time.Millisecond):
-		// Expected: Start is still blocking.
-	}
-
-	cancel()
-
-	select {
-	case err := <-done:
-		// Start should return after context cancellation. The SDK may return
-		// "already shut down" if Shutdown was already called, which is acceptable.
-		if err != nil {
-			t.Logf("Start returned error after cancellation (acceptable): %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Start did not return after context cancellation")
-	}
 }

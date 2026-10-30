@@ -44,7 +44,8 @@ import (
 )
 
 const (
-	ChunksGeneratorControllerName = "ChunksGenerator"
+	// Lowercase to match controller-runtime's own metric label; see ObserveReconciler.
+	ChunksGeneratorControllerName = "chunksgenerator"
 )
 
 // ChunksGeneratorReconciler reconciles a ChunksGenerator object
@@ -379,6 +380,7 @@ func (r *ChunksGeneratorReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&operatorv1alpha1.DocumentProcessor{}, handler.EnqueueRequestsFromMapFunc(r.findDependents), builder.WithPredicates(controllerutils.FilesProcessedChangedPredicate{})).
 		Watches(&operatorv1alpha1.VectorEmbeddingsGenerator{}, handler.EnqueueRequestsFromMapFunc(r.findDependents), builder.WithPredicates(controllerutils.FilesProcessedChangedPredicate{})).
 		Watches(&operatorv1alpha1.DestinationSyncer{}, handler.EnqueueRequestsFromMapFunc(r.findDependents), builder.WithPredicates(controllerutils.FilesProcessedChangedPredicate{})).
+		Named(ChunksGeneratorControllerName).
 		Complete(r.Metrics.ObserveReconciler(ChunksGeneratorControllerName, r))
 }
 

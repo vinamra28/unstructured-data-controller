@@ -22,6 +22,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -49,6 +50,22 @@ import (
 var (
 	scheme   = runtime.NewScheme()
 	setupLog = ctrl.Log.WithName("setup")
+)
+
+// version is the build version reported as the service.version resource
+// attribute on every metric and span. Overridden at build time with
+// -ldflags "-X main.version=..."; see the Makefile. The default is honest
+// rather than a stale literal, so an unstamped build is identifiable in the
+// telemetry backend instead of masquerading as a release.
+var version = "dev"
+
+// Shutdown is budgeted against the pod's terminationGracePeriodSeconds of 10s
+// (config/manager/manager.yaml): reconcilers drain first, then telemetry
+// flushes, and the two together have to finish before the kubelet SIGKILLs.
+// The margin absorbs process teardown.
+var (
+	gracefulShutdownTimeout  = 5 * time.Second
+	telemetryShutdownTimeout = 3 * time.Second
 )
 
 func init() {
@@ -95,13 +112,15 @@ func main() {
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
-	// Initialize OTel metrics provider. Custom OTel metrics are registered on
-	// controller-runtime's Prometheus registry so they appear on the existing
-	// /metrics endpoint alongside built-in metrics (reconcile counts, work queue depth).
-	// OTLP push to a collector activates when OTEL_EXPORTER_OTLP_ENDPOINT is set.
+	// Initialize OTel metrics. udc_* metrics are registered on
+	// controller-runtime's Prometheus registry, so they appear beside its
+	// built-in metrics wherever that endpoint is served. --metrics-bind-address
+	// defaults to "0"; config/default sets it to :8443, but config/deploy -
+	// the overlay `make deploy` builds - does not, so a default install
+	// serves nothing and OTLP push is its only delivery path.
 	metricsProvider, err := udctelemetry.Init(context.Background(), udctelemetry.Config{
 		ServiceName:          "unstructured-data-controller",
-		ServiceVersion:       "0.1.0",
+		ServiceVersion:       version,
 		PrometheusRegisterer: crmetrics.Registry,
 		// Reconcile loops run continuously across every watched resource, so
 		// exporting every trace would flood the collector. Operators can raise
@@ -213,6 +232,13 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "6dc1af3d.dataverse.redhat.com",
+		// Bounded so that mgr.Start returns, and the telemetry flush that
+		// follows it runs, inside the pod's terminationGracePeriodSeconds
+		// (10s in config/manager/manager.yaml). controller-runtime defaults
+		// this to 30s, which would let the kubelet SIGKILL the process while
+		// reconcilers were still draining - taking the final metric interval
+		// and every buffered span with it.
+		GracefulShutdownTimeout: &gracefulShutdownTimeout,
 		Cache: cache.Options{
 			DefaultNamespaces: map[string]cache.Config{
 				watchNamespace: {},
@@ -296,13 +322,6 @@ func main() {
 	}
 	// +kubebuilder:scaffold:builder
 
-	// Register the OTel metrics provider as a Runnable so it shuts down
-	// gracefully (flushing pending telemetry) when the manager stops.
-	if err := mgr.Add(metricsProvider); err != nil {
-		setupLog.Error(err, "unable to add metrics provider to manager")
-		os.Exit(1)
-	}
-
 	if metricsCertWatcher != nil {
 		setupLog.Info("Adding metrics certificate watcher to manager")
 		if err := mgr.Add(metricsCertWatcher); err != nil {
@@ -329,7 +348,26 @@ func main() {
 	}
 
 	setupLog.Info("starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	err = mgr.Start(ctrl.SetupSignalHandler())
+
+	// Shut telemetry down after Start returns, not as a manager Runnable.
+	// A Runnable with NeedLeaderElection()==false lands in controller-runtime's
+	// `Others` group, which internal.go stops BEFORE the LeaderElection group
+	// that holds the reconcilers - so the providers would be torn down while
+	// all seven controllers were still draining, and every reconcile recorded
+	// during shutdown would be dropped. Start returns only once every runnable
+	// group has stopped, which is the point at which there is nothing left to
+	// record.
+	// Fresh, bounded context: the manager's own context is already cancelled
+	// by this point, and an unbounded one would let a hung OTLP exporter
+	// block process exit indefinitely.
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), telemetryShutdownTimeout)
+	if shutdownErr := metricsProvider.Shutdown(shutdownCtx); shutdownErr != nil {
+		setupLog.Error(shutdownErr, "failed to flush telemetry on shutdown")
+	}
+	cancelShutdown()
+
+	if err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}

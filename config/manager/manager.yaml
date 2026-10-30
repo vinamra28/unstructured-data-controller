@@ -61,9 +61,18 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
-        # [OTEL] Uncomment to enable OTLP push for metrics and traces.
-        # When set, the controller pushes telemetry to the OTel Collector via gRPC.
-        # Without this, only Prometheus scraping on /metrics is available.
+        # [OTEL] Uncomment to push metrics and traces to an OTel Collector
+        # over gRPC, which is how telemetry reaches Datadog.
+        #
+        # This is the only delivery path for a default install:
+        # config/deploy, the overlay `make deploy` builds, does not set
+        # --metrics-bind-address, so controller-runtime serves no /metrics
+        # endpoint there and nothing can scrape it. (config/default does set
+        # it, but nothing deploys from that overlay.) Leaving this commented
+        # out means a default install exports nothing. Only udc_* metrics
+        # travel over OTLP; controller-runtime's own metrics (workqueue depth,
+        # reconcile totals) live on its Prometheus registry and need the
+        # endpoint exposed to be reachable.
         # - name: OTEL_EXPORTER_OTLP_ENDPOINT
         #   value: "http://otel-collector.observability.svc:4317"
         # - name: OTEL_EXPORTER_OTLP_INSECURE

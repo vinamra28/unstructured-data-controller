@@ -25,8 +25,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
 // setupTestProvider creates a Provider backed by an in-memory metric reader
@@ -318,9 +321,85 @@ func TestRecordExternalCallSplitsByOutcome(t *testing.T) {
 	assert.Equal(t, uint64(1), byOutcome["error"])
 }
 
+// TestRecordExternalCallDoesNotOwnTheSpanStatus pins which component decides
+// a span's status. RecordExternalCall receives the CALLER's context - the
+// pkg/ helpers start and end their own spans internally - so setting a status
+// here would overwrite the tool span's own outcome, and would mark it failed
+// even when the handler recovered and returned a successful result.
+func TestRecordExternalCallDoesNotOwnTheSpanStatus(t *testing.T) {
+	provider, _ := setupTestProvider(t)
+	defer func() {
+		require.NoError(t, provider.meterProvider.Shutdown(context.Background()))
+	}()
+
+	recorder := tracetest.NewSpanRecorder()
+	tracerProvider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	t.Cleanup(func() { require.NoError(t, tracerProvider.Shutdown(context.Background())) })
+
+	ctx, span := tracerProvider.Tracer("test").Start(context.Background(), "mcp.tool/caller")
+	provider.RecordExternalCall(ctx, "snowflake", "query", time.Second,
+		errors.New("dial failed: postgres://svc:hunter2@db:5432/x"))
+	span.End()
+
+	ended := recorder.Ended()
+	require.Len(t, ended, 1)
+
+	assert.NotEqual(t, codes.Error, ended[0].Status().Code,
+		"the caller's span status belongs to the caller, not to a timed sub-call")
+
+	events := ended[0].Events()
+	require.Len(t, events, 1, "the failure should still be visible as an event")
+	assert.Equal(t, "external.call.failed", events[0].Name)
+
+	var sawSanitizedMessage bool
+	for _, attr := range events[0].Attributes {
+		assert.NotContains(t, attr.Value.AsString(), "hunter2",
+			"event attributes must not carry the raw credential")
+		if attr.Key == "error.message" {
+			sawSanitizedMessage = true
+		}
+	}
+	assert.True(t, sawSanitizedMessage, "the event should carry the sanitized cause")
+}
+
 func TestCallOutcome(t *testing.T) {
 	assert.Equal(t, "success", callOutcome(nil))
 	assert.Equal(t, "error", callOutcome(errors.New("boom")))
+}
+
+// TestZeroValueProviderIsSafe covers the value an external caller or test can
+// actually construct. Provider has only unexported fields, so &Provider{} is
+// the one literal available, and it is non-nil with nil instruments - which a
+// `p == nil` guard alone does not catch. The ToolObserver case is the worst:
+// its deref sits inside the closure the MCP middleware runs from a defer, so
+// a panic there fires during unwinding and destroys the original failure.
+func TestZeroValueProviderIsSafe(t *testing.T) {
+	provider := &Provider{}
+	ctx := context.Background()
+
+	assert.NotPanics(t, func() {
+		provider.RecordFilesProcessed(ctx, "AnyController", 3)
+	}, "RecordFilesProcessed must tolerate a zero-value Provider")
+
+	assert.NotPanics(t, func() {
+		provider.RecordExternalCall(ctx, "snowflake", "query", time.Second, errors.New("boom"))
+	}, "RecordExternalCall must tolerate a zero-value Provider")
+
+	assert.NotPanics(t, func() {
+		gotCtx, endTool := provider.ToolObserver(ctx, "any_tool")
+		assert.Equal(t, ctx, gotCtx)
+		endTool("some failure")
+	}, "ToolObserver and its finish closure must tolerate a zero-value Provider")
+
+	assert.NotPanics(t, func() {
+		var retErr error
+		provider.ReconcileObserver("AnyController").End(ctx, &retErr)
+	}, "ReconcileObserver/End must tolerate a zero-value Provider")
+
+	assert.NotPanics(t, func() {
+		assert.Nil(t, provider.PrometheusHandler())
+		assert.NoError(t, provider.Shutdown(ctx))
+	}, "PrometheusHandler and Shutdown must tolerate a zero-value Provider")
 }
 
 // A nil Provider is the "telemetry disabled" case. Callers invoke these

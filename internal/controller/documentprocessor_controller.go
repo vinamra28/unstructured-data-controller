@@ -45,8 +45,9 @@ import (
 )
 
 const (
-	requeueAfter                    = 15 * time.Second
-	DocumentProcessorControllerName = "DocumentProcessor"
+	requeueAfter = 15 * time.Second
+	// Lowercase to match controller-runtime's own metric label; see ObserveReconciler.
+	DocumentProcessorControllerName = "documentprocessor"
 )
 
 var (
@@ -550,7 +551,7 @@ func (r *DocumentProcessorReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&operatorv1alpha1.ChunksGenerator{}, handler.EnqueueRequestsFromMapFunc(r.findDependents), builder.WithPredicates(controllerutils.FilesProcessedChangedPredicate{})).
 		Watches(&operatorv1alpha1.VectorEmbeddingsGenerator{}, handler.EnqueueRequestsFromMapFunc(r.findDependents), builder.WithPredicates(controllerutils.FilesProcessedChangedPredicate{})).
 		Watches(&operatorv1alpha1.DestinationSyncer{}, handler.EnqueueRequestsFromMapFunc(r.findDependents), builder.WithPredicates(controllerutils.FilesProcessedChangedPredicate{})).
-		Named("documentprocessor").
+		Named(DocumentProcessorControllerName).
 		Complete(r.Metrics.ObserveReconciler(DocumentProcessorControllerName, r))
 }
 

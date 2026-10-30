@@ -18,6 +18,7 @@ package snowflake
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 
@@ -25,6 +26,13 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/trace"
 )
+
+// ErrDocumentNotFound reports that a query ran successfully and matched no
+// rows. It is deliberately distinguishable from a transport or query failure:
+// an LLM agent guessing file IDs is a normal, successful interaction with
+// Snowflake, and folding it in with real faults would make the dependency
+// error rate fire on user behaviour and hide an actual outage behind it.
+var ErrDocumentNotFound = errors.New("no processed document found")
 
 type ProcessedDocumentResult struct {
 	FileID          string `json:"file_id" db:"file_id"`
@@ -38,7 +46,12 @@ func GetProcessedDocument(
 		trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithAttributes(dbSpanAttributes(database)...))
 	defer func() {
-		udctelemetry.RecordSpanError(span, err)
+		// A miss is a successful query, so it must not colour the span red:
+		// span-derived error rates would otherwise track how often callers
+		// guess a file ID wrong.
+		if !errors.Is(err, ErrDocumentNotFound) {
+			udctelemetry.RecordSpanError(span, err)
+		}
 		span.End()
 	}()
 	query := fmt.Sprintf(
@@ -51,7 +64,7 @@ func GetProcessedDocument(
 		return nil, err
 	}
 	if len(results) == 0 {
-		return nil, fmt.Errorf("no processed document found for file_id %q", fileID)
+		return nil, fmt.Errorf("%w: file_id %q", ErrDocumentNotFound, fileID)
 	}
 	return &results[0], nil
 }

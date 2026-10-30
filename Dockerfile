@@ -18,9 +18,14 @@ COPY api/ api/
 COPY pkg/ pkg/
 COPY internal/ internal/
 
+# VERSION is stamped into the binary as the service.version resource
+# attribute on every metric and span. Without it the image reports "dev",
+# so pass --build-arg VERSION=... when building a release.
+ARG VERSION=dev
+
 # Build
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -a -o manager cmd/main.go
+    go build -a -ldflags "-X main.version=${VERSION}" -o manager cmd/main.go
 
 # Use Red Hat UBI minimal as runtime image
 FROM registry.access.redhat.com/ubi9/ubi-minimal:latest

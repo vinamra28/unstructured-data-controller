@@ -68,7 +68,7 @@ func isPipelineAllowed(ctx context.Context, pipelineName string) bool {
 func RegisterListPipelines(
 	s *mcp.Server, k8sClient *k8sclient.Client, metricsProvider *udctelemetry.Provider,
 ) {
-	mcp.AddTool(s, &mcp.Tool{
+	registerTool(s, &mcp.Tool{
 		Name: ToolListPipelines,
 		Description: `List the UnstructuredDataPipelines the authenticated user has access to. Returns an array of {name, description, guidance}.
 If EXACTLY ONE pipeline matches the user's question, use it.

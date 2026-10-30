@@ -40,7 +40,8 @@ import (
 )
 
 const (
-	UnstructuredDataPipelineControllerName = "UnstructuredDataPipeline"
+	// Lowercase to match controller-runtime's own metric label; see ObserveReconciler.
+	UnstructuredDataPipelineControllerName = "unstructureddatapipeline"
 	PipelineLabel                          = "operator.dataverse.redhat.com/unstructured-data-pipeline"
 )
 
@@ -366,6 +367,7 @@ func (r *UnstructuredDataPipelineReconciler) SetupWithManager(mgr ctrl.Manager) 
 		Owns(&operatorv1alpha1.ChunksGenerator{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&operatorv1alpha1.VectorEmbeddingsGenerator{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&operatorv1alpha1.DestinationSyncer{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		Named(UnstructuredDataPipelineControllerName).
 		Complete(r.Metrics.ObserveReconciler(UnstructuredDataPipelineControllerName, r))
 }
 

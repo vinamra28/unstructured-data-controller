@@ -28,7 +28,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/trace"
 
 	operatorv1alpha1 "github.com/redhat-data-and-ai/unstructured-data-controller/api/v1alpha1"
 	"github.com/redhat-data-and-ai/unstructured-data-controller/pkg/auth"
@@ -52,7 +51,7 @@ func RegisterGetChunksForEmbeddings(
 	embeddingClient *embedding.HTTPClient,
 	metricsProvider *udctelemetry.Provider,
 ) {
-	mcp.AddTool(s, &mcp.Tool{
+	registerTool(s, &mcp.Tool{
 		Name: ToolGetChunks,
 		Description: `Search for relevant text chunks in a pipeline's data product using vector cosine similarity. Optionally scope the search to specific files using file_path_filter with glob patterns (e.g. "*/README.md", "*/aemv2/*").
 If pipeline_name is not known, call list_unstructured_data_pipelines_for_user first and follow the instructions in its response.
@@ -69,7 +68,9 @@ On follow-up: if the user is not satisfied, ask them which pipeline to search. D
 
 		// TelemetryMiddleware already started the tool span; enrich it with
 		// the decoded arguments, which the middleware only sees as raw JSON.
-		trace.SpanFromContext(ctx).SetAttributes(
+		// Bounded and scrubbed: these are client-supplied and the span is
+		// exported.
+		setToolSpanAttributes(ctx,
 			attribute.String("mcp.pipeline_name", args.PipelineName))
 
 		log.Info("tool invoked", "pipeline_name", args.PipelineName)
